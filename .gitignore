@@ -1,0 +1,116 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+insight_env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch / ML Models (large files - should be downloaded separately)
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.h5
+*.hdf5
+*.ckpt
+*.safetensors
+
+# Video files (large)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+
+# Image files (keep small reference images, ignore large ones)
+*.heic
+*.HEIC
+# Keep small reference images: *.jpg, *.jpeg, *.png (if < 1MB)
+# Ignore large images manually if needed
+
+# Output files
+output_*.mp4
+preprocessed_*.mp4
+combined.mp4
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Model weights (download separately)
+models/
+weights/
+checkpoints/
+
+# Data directories (if large)
+data/
+datasets/
+
+# ONNX Runtime cache
+.onnx/
+
+# InsightFace model cache (will be downloaded automatically)
+.insightface/
+
+# Real-ESRGAN models (if downloaded)
+RealESRGAN_*.pth
+
