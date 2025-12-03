@@ -28,15 +28,44 @@ try:
 except Exception:
     USE_REAL_ESRGAN = False
 
+# TorchReID for ReID (preferred over ResNet50)
+USE_TORCHREID = False
+try:
+    import torchreid
+    USE_TORCHREID = True
+    print("TorchReID module found")
+except Exception as e:
+    print(f"TorchReID not available: {e}")
+    USE_TORCHREID = False
+
+# ByteTrack for multi-object tracking
+USE_BYTETRACK = False
+byte_tracker = None
+byte_tracker_objects = None
+try:
+    from cjm_byte_track.core import BYTETracker
+    USE_BYTETRACK = True
+    print("ByteTrack module found")
+except Exception as e:
+    print(f"ByteTrack not available: {e}")
+    USE_BYTETRACK = False
+
 # ----------------------
 # CONFIG (CPU OPTIMIZED)
 # ----------------------
-VIDEO_PATH = "combined.mp4"
-REF_FACE_PATHS = ["zeeshan.jpg"]
+VIDEO_PATH = "new_video5.mp4"
+REF_FACE_PATHS = ["new_wasif1.jpg"]
 
 YOLO_PERSON_MODEL = "yolov8m.pt"        # your person model
 YOLO_FACE_MODEL = "yolov8m-face.pt"     # recommended: yolov8n-face or yolov8m-face
-DETECT_EVERY_N_FRAMES = 15
+YOLO_OBJECT_MODEL = "yolov8m.pt"       # general object detection (laptops, phones, bags, etc.)
+DETECT_EVERY_N_FRAMES = 13
+
+# Object classes to detect (COCO class IDs)
+# 0: person, 24: handbag, 26: backpack, 28: suitcase, 63: laptop, 67: cell phone, etc.
+OBJECT_CLASSES = [24, 26, 28, 63, 67]  # handbag, backpack, suitcase, laptop, cell phone
+# Set to None to detect all 80 COCO classes
+# OBJECT_CLASSES = None
 
 # thresholds (tune as needed)
 # Face recognition thresholds - LOWER scores = better matches (cosine distance)
@@ -48,7 +77,7 @@ FACE_SMALL_MAX = 0.70  # Maximum threshold for very small faces - allows recogni
 REID_THRESHOLD_CPU = 0.45  # Increased to reduce ReID false positives (was 0.45)
 
 AGGREGATION_FRAMES = 10
-TRACKLET_MAX_AGE = 30
+TRACKLET_MAX_AGE = 60  # Increased to keep tracks longer (2x for better continuity)
 IOU_THRESHOLD = 0.40
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,6 +89,7 @@ print("Real-ESRGAN available:", USE_REAL_ESRGAN)
 # ----------------------
 yolo_person = YOLO(YOLO_PERSON_MODEL)
 yolo_face = YOLO(YOLO_FACE_MODEL)   # face detector
+yolo_objects = YOLO(YOLO_OBJECT_MODEL)  # general object detector
 
 # Initialize RealESRGAN if user has it and want to use GPU if available
 if USE_REAL_ESRGAN:
@@ -81,7 +111,29 @@ if INSIGHTFACE_AVAILABLE:
     fa.prepare(ctx_id=-1, det_size=(1024, 1024))
     print("InsightFace ready.")
 
-# ReID fallback encoder (ResNet50)
+# ReID encoder: Try TorchReID first, fallback to ResNet50
+reid_model = None
+reid_tf = None
+USE_TORCHREID_ACTIVE = False
+
+if USE_TORCHREID:
+    try:
+        # Try to use OSNet x1_0 (lightweight and effective for ReID)
+        reid_model = torchreid.models.build_model(
+            name='osnet_x1_0',
+            num_classes=1000,
+            pretrained=True
+        )
+        reid_model = reid_model.to(DEVICE).eval()
+        USE_TORCHREID_ACTIVE = True
+        print("✓ Using TorchReID OSNet for ReID encoding")
+    except Exception as e:
+        print(f"⚠ TorchReID OSNet init failed: {e}")
+        print("   Falling back to ResNet50 for ReID")
+        USE_TORCHREID_ACTIVE = False
+        reid_model = None
+
+# ResNet50 fallback encoder
 def build_resnet_encoder():
     model = resnet50(pretrained=True).eval().to(DEVICE)
     transform = T.Compose([
@@ -92,17 +144,89 @@ def build_resnet_encoder():
     ])
     return model, transform
 
-reid_model, reid_tf = build_resnet_encoder()
+# Initialize ResNet50 as fallback (always available)
+reid_model_resnet, reid_tf = build_resnet_encoder()
+
+if not USE_TORCHREID_ACTIVE:
+    reid_model = reid_model_resnet  # Use ResNet50 as primary if TorchReID not available
+    print("✓ Using ResNet50 for ReID encoding")
+else:
+    # Keep ResNet50 ready as fallback
+    print("✓ ResNet50 ready as fallback for ReID encoding")
+
+# Initialize ByteTrack if available
+if USE_BYTETRACK:
+    try:
+        # Get video FPS for ByteTrack initialization
+        cap_temp = cv2.VideoCapture(VIDEO_PATH)
+        fps = cap_temp.get(cv2.CAP_PROP_FPS) or 30.0  # Default to 30 if unavailable
+        cap_temp.release()
+        
+        # Initialize ByteTrack with appropriate parameters
+        # track_thresh: detection confidence threshold (0.25 = use low confidence detections)
+        # track_buffer: frames to keep lost tracks (increased for better continuity)
+        # match_thresh: IoU threshold for matching (lower = more lenient, better for fast movement)
+        byte_tracker = BYTETracker(
+            track_thresh=0.25,  # Use low confidence detections (ByteTrack's strength)
+            track_buffer=60,  # Keep lost tracks longer (2x TRACKLET_MAX_AGE for better continuity)
+            match_thresh=0.6,  # Lower threshold for more lenient matching (better for fast movement)
+            frame_rate=fps
+        )
+        print(f"✓ ByteTrack initialized for persons (FPS: {fps:.1f})")
+        
+        # Initialize separate ByteTrack for objects (better handling of sudden movements)
+        byte_tracker_objects = BYTETracker(
+            track_thresh=0.2,  # Lower threshold for objects (they can be harder to detect)
+            track_buffer=40,  # Keep lost tracks for 40 frames
+            match_thresh=0.5,  # More lenient matching for objects (handles sudden movements better)
+            frame_rate=fps
+        )
+        print(f"✓ ByteTrack initialized for objects (FPS: {fps:.1f})")
+    except Exception as e:
+        print(f"⚠ ByteTrack initialization failed: {e}")
+        USE_BYTETRACK = False
+        byte_tracker = None
+        byte_tracker_objects = None
+else:
+    print("⚠ ByteTrack not available - using IOU-based tracking only")
+    byte_tracker_objects = None
 
 def reid_encode(img):
-    try:
-        x = reid_tf(img[:,:,::-1]).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            feat = reid_model(x).cpu().numpy().squeeze()
-        feat = feat / (np.linalg.norm(feat)+1e-8)
-        return feat.astype(np.float32)
-    except Exception:
-        return None
+    """Encode person image for ReID. Uses TorchReID if available, otherwise ResNet50."""
+    if USE_TORCHREID_ACTIVE and reid_model is not None:
+        # Use TorchReID OSNet (preferred method)
+        try:
+            # Convert BGR to RGB and resize for ReID
+            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            pil_img = T.ToPILImage()(rgb_img)
+            pil_img = T.Resize((256, 128))(pil_img)  # ReID standard size (width, height)
+            tensor_img = T.ToTensor()(pil_img).unsqueeze(0).to(DEVICE)
+            
+            # Normalize for ImageNet (torchreid models expect this)
+            normalize_tf = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            tensor_img = normalize_tf(tensor_img)
+            
+            with torch.no_grad():
+                feat = reid_model(tensor_img).cpu().numpy().squeeze()
+            
+            feat = feat / (np.linalg.norm(feat) + 1e-8)
+            return feat.astype(np.float32)
+        except Exception as e:
+            # If TorchReID fails, fallback to ResNet50
+            pass
+    
+    # Fallback to ResNet50 (always available)
+    if reid_tf is not None:
+        try:
+            x = reid_tf(img[:,:,::-1]).unsqueeze(0).to(DEVICE)
+            with torch.no_grad():
+                feat = reid_model_resnet(x).cpu().numpy().squeeze()
+            feat = feat / (np.linalg.norm(feat)+1e-8)
+            return feat.astype(np.float32)
+        except Exception:
+            return None
+    
+    return None
 
 # ----------------------
 # Build reference embeddings
@@ -258,8 +382,26 @@ def box_inside(inner, outer):
     x1,y1,x2,y2 = outer
     return (cx >= x1 and cx <= x2 and cy >= y1 and cy <= y2)
 
+def apply_nms(boxes, scores, iou_threshold=0.5):
+    """Apply Non-Maximum Suppression to filter overlapping boxes.
+    Returns indices of boxes to keep."""
+    if len(boxes) == 0:
+        return []
+    
+    # Convert boxes to format for NMS: [x1, y1, x2, y2]
+    boxes_array = np.array(boxes, dtype=np.float32)
+    scores_array = np.array(scores, dtype=np.float32)
+    
+    # Use OpenCV's NMS
+    indices = cv2.dnn.NMSBoxes(boxes, scores_array, score_threshold=0.0, nms_threshold=iou_threshold)
+    
+    if len(indices) == 0:
+        return []
+    
+    return indices.flatten().tolist()
+
 # ----------------------
-# Tracklet class
+# Tracklet class (for persons)
 # ----------------------
 class Tracklet:
     def __init__(self, tid, bbox, frame_idx):
@@ -303,12 +445,47 @@ class Tracklet:
         return 0
 
 # ----------------------
+# ObjectTracklet class (for objects like backpacks, laptops, etc.)
+# ----------------------
+class ObjectTracklet:
+    def __init__(self, oid, class_name, bbox, confidence, frame_idx):
+        self.id = oid
+        self.class_name = class_name
+        self.bboxes = deque(maxlen=30)  # Keep last 30 bboxes
+        self.bboxes.append(bbox)
+        self.confidences = deque(maxlen=30)
+        self.confidences.append(confidence)
+        self.last_frame = frame_idx
+        self.first_frame = frame_idx
+
+    def update(self, bbox, confidence, frame_idx):
+        self.bboxes.append(bbox)
+        self.confidences.append(confidence)
+        self.last_frame = frame_idx
+    
+    def get_latest_bbox(self):
+        """Get the most recent bounding box"""
+        if self.bboxes:
+            return self.bboxes[-1]
+        return None
+    
+    def get_avg_confidence(self):
+        """Get average confidence score"""
+        if self.confidences:
+            return np.mean(list(self.confidences))
+        return 0.0
+
+# ----------------------
 # Main loop
 # ----------------------
 cap = cv2.VideoCapture(VIDEO_PATH)
 frame_idx = 0
-tracklets = {}
+tracklets = {}  # tid -> Tracklet (for persons)
+object_tracklets = {}  # oid -> ObjectTracklet (for objects)
 next_tid = 1
+next_obj_id = 1
+OBJ_TRACK_MAX_AGE = 30  # Keep object tracks for 30 frames after last detection
+OBJ_IOU_THRESHOLD = 0.3  # IoU threshold for matching object detections
 
 # small helper to map face boxes per frame
 face_boxes_frame = []
@@ -321,17 +498,128 @@ while True:
     frame_idx += 1
     h, w = frame.shape[:2]
 
+    # On non-detection frames, update ByteTrack with empty detections to maintain tracking
+    # This is critical for tracking continuity - ByteTrack needs to be updated every frame
+    if USE_BYTETRACK and byte_tracker is not None and frame_idx % DETECT_EVERY_N_FRAMES != 0:
+        try:
+            # Update ByteTrack with empty detections to maintain existing tracks
+            # ByteTrack will predict positions for existing tracks even without new detections
+            empty_detections = np.array([], dtype=np.float32).reshape(0, 5)
+            img_info = (h, w)
+            img_size = (w, h)
+            tracked_objects = byte_tracker.update(empty_detections, img_info, img_size)
+            
+            # Update tracklets with ByteTrack predictions
+            for track in tracked_objects:
+                track_id = int(track.track_id)
+                x1_bt, y1_bt, x2_bt, y2_bt = int(track.tlbr[0]), int(track.tlbr[1]), int(track.tlbr[2]), int(track.tlbr[3])
+                
+                # Validate bbox
+                if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                    continue
+                
+                x1_bt, y1_bt, x2_bt, y2_bt = max(0, x1_bt), max(0, y1_bt), min(w, x2_bt), min(h, y2_bt)
+                if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                    continue
+                
+                byte_track_bbox = (x1_bt, y1_bt, x2_bt, y2_bt)
+                
+                # Update tracklet if it exists
+                if track_id in tracklets:
+                    tracklets[track_id].bboxes.append(byte_track_bbox)
+                    tracklets[track_id].last_frame = frame_idx
+        except Exception as e:
+            pass  # ByteTrack update failed, continue
+
+    # Initialize detected_objects for visualization (empty if not detecting this frame)
+    detected_objects = []
+    
     # run detection every N frames
     if frame_idx % DETECT_EVERY_N_FRAMES == 0:
-        # person detection
-        p_results = yolo_person.predict(frame, imgsz=640, conf=0.45, classes=[0], verbose=False)
+        # person detection - use lower confidence for ByteTrack (it handles low-confidence detections well)
+        # ByteTrack's strength is using low-confidence detections for better association
+        p_results = yolo_person.predict(frame, imgsz=640, conf=0.3, classes=[0], verbose=False)
         person_boxes = []
+        person_detections = []  # For ByteTrack: [x1, y1, x2, y2, score]
+        
         if len(p_results):
+            all_boxes = []
+            all_scores = []
+            all_detections = []
+            
             for b in p_results[0].boxes:
                 x1,y1,x2,y2 = b.xyxy[0].cpu().numpy().astype(int)
+                conf = float(b.conf[0].cpu().numpy())
                 x1,y1,x2,y2 = max(0,x1),max(0,y1),min(w,x2),min(h,y2)
-                person_boxes.append((x1,y1,x2,y2))
-
+                
+                # Skip invalid boxes
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Filter out small/partial detections (likely hands, arms, etc.)
+                box_width = x2 - x1
+                box_height = y2 - y1
+                box_area = box_width * box_height
+                frame_area = w * h
+                
+                # Skip very small boxes (likely body parts, not full persons)
+                # Minimum size: at least 2% of frame area, or minimum 100x150 pixels
+                min_area = max(frame_area * 0.02, 100 * 150)
+                if box_area < min_area:
+                    continue
+                
+                # Skip boxes that are too wide relative to height (likely not a person)
+                # Person boxes should be roughly 1:2 to 1:3 width:height ratio
+                aspect_ratio = box_width / max(box_height, 1)
+                if aspect_ratio > 0.8:  # Too wide (likely not a person)
+                    continue
+                
+                # Skip boxes that are too tall and narrow (likely not a person)
+                if aspect_ratio < 0.2:  # Too narrow
+                    continue
+                
+                all_boxes.append([x1, y1, x2, y2])
+                all_scores.append(conf)
+                all_detections.append((x1,y1,x2,y2))
+            
+            # Apply NMS to filter overlapping detections (same person detected multiple times)
+            # Use moderate IoU threshold (0.45) - ByteTrack can handle some overlapping detections
+            # Too strict NMS might remove valid detections that ByteTrack could use for association
+            if len(all_boxes) > 0:
+                nms_indices = apply_nms(all_boxes, all_scores, iou_threshold=0.45)
+                
+                person_boxes = []
+                person_detections = []
+                for idx in nms_indices:
+                    person_boxes.append(all_detections[idx])
+                    x1, y1, x2, y2 = all_detections[idx]
+                    person_detections.append([x1, y1, x2, y2, all_scores[idx]])
+            else:
+                person_boxes = []
+                person_detections = []
+        
+        # Update ByteTrack with detections (or empty if no detections)
+        # ByteTrack MUST be updated every detection frame to maintain tracking continuity
+        tracked_objects = []
+        if USE_BYTETRACK and byte_tracker is not None:
+            try:
+                if len(person_detections) > 0:
+                    detections_array = np.array(person_detections, dtype=np.float32)
+                else:
+                    # Update with empty detections to maintain existing tracks
+                    detections_array = np.array([], dtype=np.float32).reshape(0, 5)
+                
+                # ByteTrack.update() requires: (output_results, img_info, img_size)
+                img_info = (h, w)  # Height, width
+                img_size = (w, h)  # Width, height
+                tracked_objects = byte_tracker.update(detections_array, img_info, img_size)
+                # Debug: print number of tracked objects
+                if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                    print(f"[ByteTrack] Frame {frame_idx}: {len(person_detections)} detections -> {len(tracked_objects)} tracked objects")
+            except Exception as e:
+                print(f"ByteTrack update error: {e}")
+                tracked_objects = []
+        
         # face detection (full frame) - lower confidence to catch more faces
         f_results = yolo_face.predict(frame, imgsz=640, conf=0.25, verbose=False)
         face_boxes = []
@@ -343,254 +631,715 @@ while True:
 
         # keep face boxes for this frame (used when matching)
         face_boxes_frame = face_boxes
-
-        # match boxes to tracklets (use person boxes as primary track regions)
-        for box in person_boxes:
-            best_tid, best_iouv = None, 0
-            for tid, t in tracklets.items():
-                val = iou(box, t.bboxes[-1])
-                if val > best_iouv:
-                    best_tid, best_iouv = tid, val
-
-            x1,y1,x2,y2 = box
-            crop_person = frame[y1:y2, x1:x2].copy()
-
-            # ---- Face detection: Try multiple methods for best results
-            face_emb = None
-            face_size = 0
-
-            # Method 1: Try YOLO face boxes first (if available)
-            matched_face = None
-            for fb in face_boxes_frame:
-                if box_inside(fb, box) or iou(fb, box) > 0.1:
-                    matched_face = fb
-                    break
-
-            if matched_face is not None:
-                fx1,fy1,fx2,fy2 = matched_face
-                # ensure clamp
-                fx1,fy1,fx2,fy2 = max(0,fx1),max(0,fy1),min(w,fx2),min(h,fy2)
-                face_crop = frame[fy1:fy2, fx1:fx2].copy()
-                face_size = (fx2-fx1)
-
-                # For faces < 60px, ALWAYS upscale before getting embedding for better quality
-                # This improves recognition accuracy for distant faces
-                if face_size < 60:
-                    # Use larger upscale factor for very small faces
-                    upscale_factor = 4 if face_size < 30 else (3 if face_size < 45 else 2)
-                    face_crop_up = sr_enhance(face_crop, factor=upscale_factor)
-                    
-                    # Try InsightFace on upscaled crop first (better quality)
-                    if fa:
-                        try:
-                            faces_up = fa.get(face_crop_up)
-                            if faces_up and len(faces_up) > 0:
-                                # Debug: check what attributes are available
-                                if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                    print(f"  → InsightFace found {len(faces_up)} face(s) in upscaled crop, has embedding: {hasattr(faces_up[0], 'embedding')}")
-                                if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                    face_emb = normalize(np.array(faces_up[0].embedding))
-                                    if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                        print(f"  → ✓ Got embedding from upscaled face crop!")
-                                # Update face_size from upscaled detection
-                                if hasattr(faces_up[0], 'bbox'):
-                                    detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                    if detected_w > 0:
-                                        face_size = detected_w
-                        except Exception as e:
-                            if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                print(f"  → Error getting embedding from upscaled crop: {e}")
-                            pass
-                else:
-                    # For larger faces (>= 60px), try InsightFace on original crop
-                    if fa:
-                        try:
-                            faces = fa.get(face_crop)
-                            if faces and len(faces) > 0:
-                                # Try to get embedding directly
-                                if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
-                                    face_emb = normalize(np.array(faces[0].embedding))
-                                # Update face_size from InsightFace detection if available
-                                if hasattr(faces[0], 'bbox'):
-                                    detected_w = int(faces[0].bbox[2] - faces[0].bbox[0])
-                                    if detected_w > 0:
-                                        face_size = detected_w
-                        except Exception as e:
-                            pass
+        
+        # General object detection (laptops, phones, bags, etc.)
+        detected_objects = []  # List of (class_name, bbox, confidence)
+        # Lower confidence threshold for better detection of objects like backpacks
+        obj_conf_threshold = 0.2  # Lowered to 0.2 for better detection of backpacks/bags
+        
+        if OBJECT_CLASSES is not None:
+            # Detect specific classes only - use larger imgsz for better small object detection
+            obj_results = yolo_objects.predict(frame, imgsz=1280, conf=obj_conf_threshold, classes=OBJECT_CLASSES, verbose=False)
+        else:
+            # Detect all COCO classes
+            obj_results = yolo_objects.predict(frame, imgsz=1280, conf=obj_conf_threshold, verbose=False)
+        
+        if len(obj_results):
+            # COCO class names
+            class_names = yolo_objects.names
+            current_detections = []  # List of (class_name, bbox, confidence)
+            
+            for b in obj_results[0].boxes:
+                cls_id = int(b.cls[0].cpu().numpy())
+                conf = float(b.conf[0].cpu().numpy())
+                x1, y1, x2, y2 = b.xyxy[0].cpu().numpy().astype(int)
+                x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
                 
-                # Fallback: if upscaling didn't work for small faces, try original
-                if face_emb is None and face_size < 60:
-                    if fa:
-                        try:
-                            faces = fa.get(face_crop)
-                            if faces and len(faces) > 0:
-                                if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
-                                    face_emb = normalize(np.array(faces[0].embedding))
-                        except Exception as e:
-                            pass
+                # Skip invalid boxes
+                if x2 <= x1 or y2 <= y1:
+                    continue
                 
-                # Final fallback: if still no embedding and face is small, try upscaling
-                if face_emb is None and face_size < 80:
-                    # Use larger upscale factor for very small faces
-                    upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
-                    face_crop_up = sr_enhance(face_crop, factor=upscale_factor)
-                    
-                    # Try InsightFace on upscaled crop
-                    if fa:
-                        try:
-                            faces_up = fa.get(face_crop_up)
-                            if faces_up and len(faces_up) > 0:
-                                if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                    face_emb = normalize(np.array(faces_up[0].embedding))
-                                # Update face_size from upscaled detection
-                                if hasattr(faces_up[0], 'bbox'):
-                                    detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                    if detected_w > 0:
-                                        face_size = detected_w
-                        except Exception as e:
-                            pass
-
-            # Method 2: ALWAYS try InsightFace on person crop (most reliable, works even if YOLO misses faces)
-            # This is critical because InsightFace is better at detecting faces in person crops
-            if face_emb is None and fa:
+                class_name = class_names.get(cls_id, f"class_{cls_id}")
+                current_detections.append((class_name, (x1, y1, x2, y2), conf))
+            
+            # Use ByteTrack for object tracking (handles sudden movements better)
+            if USE_BYTETRACK and byte_tracker_objects is not None:
                 try:
-                    # First try on person crop directly - this should work!
-                    # InsightFace is very good at detecting faces in person crops
-                    faces = fa.get(crop_person)
-                    if faces and len(faces) > 0:
-                        f = faces[0]
-                        # Debug output
-                        if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                            print(f"  → InsightFace found {len(faces)} face(s) in person crop, has embedding: {hasattr(f, 'embedding')}")
+                    # Prepare detections for ByteTrack: [x1, y1, x2, y2, score]
+                    obj_detections_array = []
+                    obj_detection_info = []  # Store (class_name, bbox) for each detection
+                    
+                    for class_name, bbox, conf in current_detections:
+                        x1, y1, x2, y2 = bbox
+                        obj_detections_array.append([x1, y1, x2, y2, conf])
+                        obj_detection_info.append((class_name, bbox))
+                    
+                    if len(obj_detections_array) > 0:
+                        detections_array = np.array(obj_detections_array, dtype=np.float32)
+                    else:
+                        detections_array = np.array([], dtype=np.float32).reshape(0, 5)
+                    
+                    img_info = (h, w)
+                    img_size = (w, h)
+                    tracked_obj_tracks = byte_tracker_objects.update(detections_array, img_info, img_size)
+                    
+                    # Match ByteTrack tracks to detections and update object_tracklets
+                    # Create a mapping from ByteTrack ID to class_name and bbox
+                    for track in tracked_obj_tracks:
+                        track_id = int(track.track_id)
+                        x1_bt, y1_bt, x2_bt, y2_bt = int(track.tlbr[0]), int(track.tlbr[1]), int(track.tlbr[2]), int(track.tlbr[3])
                         
-                        # face bbox is relative to crop_person: compute absolute width
-                        if hasattr(f, 'bbox') and f.bbox is not None:
-                            fw = int(f.bbox[2] - f.bbox[0])
-                            face_size = max(face_size, fw)  # Use larger of YOLO or InsightFace size
+                        if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                            continue
                         
-                        # ALWAYS try to get embedding directly first (even for small faces)
-                        # InsightFace embeddings work well even on small faces
-                        if hasattr(f, 'embedding') and f.embedding is not None:
-                            face_emb = normalize(np.array(f.embedding))
+                        x1_bt, y1_bt, x2_bt, y2_bt = max(0, x1_bt), max(0, y1_bt), min(w, x2_bt), min(h, y2_bt)
+                        if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                            continue
+                        
+                        byte_track_bbox = (x1_bt, y1_bt, x2_bt, y2_bt)
+                        
+                        # Find best matching detection (using IoU first, then distance)
+                        # ByteTrack bboxes might be slightly different from detection bboxes
+                        best_detection = None
+                        best_iou_val = 0.05  # Very low threshold to catch any overlap
+                        best_distance = float('inf')
+                        
+                        for class_name, bbox, conf in current_detections:
+                            iou_val = iou(byte_track_bbox, bbox)
+                            if iou_val > best_iou_val:
+                                best_iou_val = iou_val
+                                best_detection = (class_name, bbox, conf)
+                            
+                            # Also calculate distance for fallback
+                            cx_bt = (x1_bt + x2_bt) / 2
+                            cy_bt = (y1_bt + y2_bt) / 2
+                            cx_det = (bbox[0] + bbox[2]) / 2
+                            cy_det = (bbox[1] + bbox[3]) / 2
+                            dist = ((cx_bt - cx_det)**2 + (cy_bt - cy_det)**2)**0.5
+                            if dist < best_distance:
+                                best_distance = dist
+                                if not best_detection:  # If no IoU match, use closest by distance
+                                    best_detection = (class_name, bbox, conf)
+                        
+                        # Use detection info if available, otherwise use ByteTrack bbox
+                        if best_detection:
+                            class_name, det_bbox, conf = best_detection
+                            # Use detection bbox (more accurate) but ByteTrack ID
+                            bbox_to_store = det_bbox
+                        else:
+                            # No matching detection - use ByteTrack bbox and try to get class from existing track
+                            bbox_to_store = byte_track_bbox
+                            if track_id in object_tracklets:
+                                # Existing track - use its class name
+                                class_name = object_tracklets[track_id].class_name
+                                conf = object_tracklets[track_id].get_avg_confidence()
+                            else:
+                                # New track without detection match - ALWAYS match to closest detection
+                                # ByteTrack tracks come from detections, so there should always be a match
+                                if len(current_detections) > 0:
+                                    # Find closest by distance (no threshold - ByteTrack tracks come from detections)
+                                    closest = None
+                                    min_dist = float('inf')
+                                    for class_name_det, bbox_det, conf_det in current_detections:
+                                        cx_bt = (x1_bt + x2_bt) / 2
+                                        cy_bt = (y1_bt + y2_bt) / 2
+                                        cx_det = (bbox_det[0] + bbox_det[2]) / 2
+                                        cy_det = (bbox_det[1] + bbox_det[3]) / 2
+                                        dist = ((cx_bt - cx_det)**2 + (cy_bt - cy_det)**2)**0.5
+                                        if dist < min_dist:
+                                            min_dist = dist
+                                            closest = (class_name_det, bbox_det, conf_det)
+                                    
+                                    if closest:
+                                        class_name, bbox_to_store, conf = closest
+                                        if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                                            print(f"[Object Tracking] Track {track_id} matched to {class_name} by distance ({min_dist:.1f}px)")
+                                else:
+                                    # No detections at all - skip
+                                    continue
+                        
+                        # Update or create object tracklet with ByteTrack ID
+                        if track_id in object_tracklets:
+                            object_tracklets[track_id].update(bbox_to_store, conf, frame_idx)
+                        else:
+                            object_tracklets[track_id] = ObjectTracklet(track_id, class_name, bbox_to_store, conf, frame_idx)
+                    
+                    # Clean up old tracks
+                    tracks_to_remove = []
+                    for oid, obj_track in object_tracklets.items():
+                        if frame_idx - obj_track.last_frame > OBJ_TRACK_MAX_AGE:
+                            tracks_to_remove.append(oid)
+                    for oid in tracks_to_remove:
+                        del object_tracklets[oid]
+                    
+                    if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                        obj_names = [obj[0] for obj in current_detections] if current_detections else []
+                        matched_count = sum(1 for tid in object_tracklets.keys() if object_tracklets[tid].last_frame == frame_idx)
+                        print(f"[Object Tracking] Frame {frame_idx}: Detected {len(current_detections)} objects: {obj_names}, ByteTrack tracks: {len(tracked_obj_tracks)}, Active object_tracklets: {len(object_tracklets)}, New/Updated this frame: {matched_count}")
+                
+                except Exception as e:
+                    print(f"ByteTrack object tracking error: {e}")
+                    # Fallback to IoU-based tracking
+                    tracked_obj_tracks = []
+            else:
+                # Fallback: IoU-based tracking if ByteTrack not available
+                matched_track_ids = set()
+                for class_name, bbox, conf in current_detections:
+                    best_match_id = None
+                    best_iou = OBJ_IOU_THRESHOLD
+                    
+                    for oid, obj_track in object_tracklets.items():
+                        if obj_track.class_name != class_name:
+                            continue
+                        if frame_idx - obj_track.last_frame > OBJ_TRACK_MAX_AGE:
+                            continue
+                        
+                        last_bbox = obj_track.get_latest_bbox()
+                        if last_bbox:
+                            iou_val = iou(bbox, last_bbox)
+                            if iou_val > best_iou:
+                                best_iou = iou_val
+                                best_match_id = oid
+                    
+                    if best_match_id is not None:
+                        object_tracklets[best_match_id].update(bbox, conf, frame_idx)
+                    else:
+                        object_tracklets[next_obj_id] = ObjectTracklet(next_obj_id, class_name, bbox, conf, frame_idx)
+                        next_obj_id += 1
+        
+        # Update ByteTrack for objects on non-detection frames too (maintain tracking continuity)
+        if USE_BYTETRACK and byte_tracker_objects is not None and frame_idx % DETECT_EVERY_N_FRAMES != 0:
+            try:
+                empty_detections = np.array([], dtype=np.float32).reshape(0, 5)
+                img_info = (h, w)
+                img_size = (w, h)
+                tracked_obj_tracks = byte_tracker_objects.update(empty_detections, img_info, img_size)
+                
+                # Update object_tracklets with ByteTrack predictions
+                for track in tracked_obj_tracks:
+                    track_id = int(track.track_id)
+                    x1_bt, y1_bt, x2_bt, y2_bt = int(track.tlbr[0]), int(track.tlbr[1]), int(track.tlbr[2]), int(track.tlbr[3])
+                    
+                    if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                        continue
+                    
+                    x1_bt, y1_bt, x2_bt, y2_bt = max(0, x1_bt), max(0, y1_bt), min(w, x2_bt), min(h, y2_bt)
+                    if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                        continue
+                    
+                    byte_track_bbox = (x1_bt, y1_bt, x2_bt, y2_bt)
+                    
+                    if track_id in object_tracklets:
+                        # Update with ByteTrack predicted position
+                        obj_track = object_tracklets[track_id]
+                        # Use average confidence from track history
+                        avg_conf = obj_track.get_avg_confidence()
+                        object_tracklets[track_id].update(byte_track_bbox, avg_conf, frame_idx)
+                    # Note: Don't create new tracklets on non-detection frames - wait for next detection frame
+            except Exception as e:
+                pass  # ByteTrack update failed, continue
+        
+        # Update detected_objects list with tracked objects (for visualization)
+        detected_objects = []
+        for oid, obj_track in object_tracklets.items():
+            if frame_idx - obj_track.last_frame <= OBJ_TRACK_MAX_AGE:
+                bbox = obj_track.get_latest_bbox()
+                if bbox:
+                    avg_conf = obj_track.get_avg_confidence()
+                    detected_objects.append((obj_track.class_name, bbox, avg_conf))
+        
+        # Debug: Also try detecting ALL classes to see if backpack is detected with different settings
+        # This helps debug if the class ID is correct or if backpack needs even lower threshold
+        if frame_idx <= DETECT_EVERY_N_FRAMES * 5:
+            all_obj_results = yolo_objects.predict(frame, imgsz=1280, conf=0.15, verbose=False)
+            if len(all_obj_results):
+                class_names = yolo_objects.names
+                all_detected = {}
+                for b in all_obj_results[0].boxes:
+                    cls_id = int(b.cls[0].cpu().numpy())
+                    conf = float(b.conf[0].cpu().numpy())
+                    class_name = class_names.get(cls_id, f"class_{cls_id}")
+                    if class_name not in all_detected or conf > all_detected[class_name]:
+                        all_detected[class_name] = conf
+                
+                # Check if backpack was detected in all classes
+                if 'backpack' in all_detected:
+                    print(f"[Debug] ✓ Backpack detected with confidence {all_detected['backpack']:.3f} (class ID: 24)")
+                elif any('bag' in name.lower() or 'pack' in name.lower() for name in all_detected.keys()):
+                    bag_related = [(name, conf) for name, conf in all_detected.items() if 'bag' in name.lower() or 'pack' in name.lower()]
+                    print(f"[Debug] Bag-related objects detected: {bag_related}")
+                # Show all detected objects for debugging
+                if frame_idx <= DETECT_EVERY_N_FRAMES * 2:
+                    print(f"[Debug] All objects detected (conf >= 0.15): {list(all_detected.keys())}")
+
+        # Process ByteTrack tracked objects - ByteTrack already handles ID assignment and matching
+        # ByteTrack's internal logic handles duplicate/overlapping tracks, so we trust its output
+        if USE_BYTETRACK and len(tracked_objects) > 0:
+            # Process each ByteTrack track directly - ByteTrack handles association internally
+            for track in tracked_objects:
+                track_id = int(track.track_id)
+                # Get ByteTrack bbox
+                x1_bt, y1_bt, x2_bt, y2_bt = int(track.tlbr[0]), int(track.tlbr[1]), int(track.tlbr[2]), int(track.tlbr[3])
+                
+                # Validate ByteTrack bbox - skip if invalid
+                if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                    continue  # Skip invalid ByteTrack bboxes
+                
+                x1_bt, y1_bt, x2_bt, y2_bt = max(0, x1_bt), max(0, y1_bt), min(w, x2_bt), min(h, y2_bt)
+                
+                # Double-check after clamping
+                if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                    continue  # Skip if still invalid after clamping
+                
+                byte_track_bbox = (x1_bt, y1_bt, x2_bt, y2_bt)
+                
+                # Find the closest person box to this ByteTrack bbox (for face/ReID extraction)
+                best_box = None
+                best_iou_val = 0
+                for box in person_boxes:
+                    iou_val = iou(byte_track_bbox, box)
+                    if iou_val > best_iou_val:
+                        best_iou_val = iou_val
+                        best_box = box
+                
+                # Use best matching person box for face/ReID, or ByteTrack bbox if no good match
+                # Prefer person detection box (more accurate) over ByteTrack predicted box
+                # Lower threshold to 0.2 to catch more matches (ByteTrack bboxes might be slightly off)
+                if best_box and best_iou_val > 0.2:  # More lenient overlap threshold
+                    box = best_box
+                    # Use person detection box for visualization (more accurate)
+                    vis_bbox = best_box
+                else:
+                    box = byte_track_bbox
+                    # Use ByteTrack bbox if no person box matches - still visualize it!
+                    vis_bbox = byte_track_bbox
+                
+                x1, y1, x2, y2 = box
+                
+                # Validate crop dimensions before extracting
+                if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+                    continue  # Skip invalid crops
+                
+                crop_person = frame[y1:y2, x1:x2].copy()
+                
+                # Check if crop is valid (not empty)
+                if crop_person.size == 0 or crop_person.shape[0] == 0 or crop_person.shape[1] == 0:
+                    continue  # Skip empty crops
+                
+                # Use ByteTrack ID directly - ByteTrack maintains ID consistency
+                current_tid = track_id
+                
+                # Update or create tracklet with accurate person detection box (for visualization)
+                # Store the person detection box if available, otherwise use ByteTrack bbox
+                if current_tid not in tracklets:
+                    tracklets[current_tid] = Tracklet(current_tid, vis_bbox, frame_idx)
+                else:
+                    # Update existing tracklet with accurate bbox (person detection preferred)
+                    tracklets[current_tid].bboxes.append(vis_bbox)
+                    tracklets[current_tid].last_frame = frame_idx
+                
+                # ---- Face detection: Try multiple methods for best results
+                face_emb = None
+                face_size = 0
+
+                # Method 1: Try YOLO face boxes first (if available)
+                matched_face = None
+                for fb in face_boxes_frame:
+                    if box_inside(fb, box) or iou(fb, box) > 0.1:
+                        matched_face = fb
+                        break
+
+                if matched_face is not None:
+                    fx1,fy1,fx2,fy2 = matched_face
+                    # ensure clamp
+                    fx1,fy1,fx2,fy2 = max(0,fx1),max(0,fy1),min(w,fx2),min(h,fy2)
+                    face_crop = frame[fy1:fy2, fx1:fx2].copy()
+                    face_size = (fx2-fx1)
+
+                    # For faces < 60px, ALWAYS upscale before getting embedding for better quality
+                    # This improves recognition accuracy for distant faces
+                    if face_size < 60:
+                        # Use larger upscale factor for very small faces
+                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 45 else 2)
+                        face_crop_up = sr_enhance(face_crop, factor=upscale_factor)
+                        
+                        # Try InsightFace on upscaled crop first (better quality)
+                        if fa:
+                            try:
+                                faces_up = fa.get(face_crop_up)
+                                if faces_up and len(faces_up) > 0:
+                                    # Debug: check what attributes are available
+                                    if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                                        print(f"  → InsightFace found {len(faces_up)} face(s) in upscaled crop, has embedding: {hasattr(faces_up[0], 'embedding')}")
+                                    if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
+                                        face_emb = normalize(np.array(faces_up[0].embedding))
+                                        if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                                            print(f"  → ✓ Got embedding from upscaled face crop!")
+                                    # Update face_size from upscaled detection
+                                    if hasattr(faces_up[0], 'bbox'):
+                                        detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
+                                        if detected_w > 0:
+                                            face_size = detected_w
+                            except Exception as e:
+                                if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                                    print(f"  → Error getting embedding from upscaled crop: {e}")
+                                pass
+                    else:
+                        # For larger faces (>= 60px), try InsightFace on original crop
+                        if fa:
+                            try:
+                                faces = fa.get(face_crop)
+                                if faces and len(faces) > 0:
+                                    # Try to get embedding directly
+                                    if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
+                                        face_emb = normalize(np.array(faces[0].embedding))
+                                    # Update face_size from InsightFace detection if available
+                                    if hasattr(faces[0], 'bbox'):
+                                        detected_w = int(faces[0].bbox[2] - faces[0].bbox[0])
+                                        if detected_w > 0:
+                                            face_size = detected_w
+                            except Exception as e:
+                                pass
+                    
+                    # Fallback: if upscaling didn't work for small faces, try original
+                    if face_emb is None and face_size < 60:
+                        if fa:
+                            try:
+                                faces = fa.get(face_crop)
+                                if faces and len(faces) > 0:
+                                    if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
+                                        face_emb = normalize(np.array(faces[0].embedding))
+                            except Exception as e:
+                                pass
+                    
+                    # Final fallback: if still no embedding and face is small, try upscaling
+                    if face_emb is None and face_size < 80:
+                        # Use larger upscale factor for very small faces
+                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
+                        face_crop_up = sr_enhance(face_crop, factor=upscale_factor)
+                        
+                        # Try InsightFace on upscaled crop
+                        if fa:
+                            try:
+                                faces_up = fa.get(face_crop_up)
+                                if faces_up and len(faces_up) > 0:
+                                    if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
+                                        face_emb = normalize(np.array(faces_up[0].embedding))
+                                    # Update face_size from upscaled detection
+                                    if hasattr(faces_up[0], 'bbox'):
+                                        detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
+                                        if detected_w > 0:
+                                            face_size = detected_w
+                            except Exception as e:
+                                pass
+
+                # Method 2: ALWAYS try InsightFace on person crop (most reliable, works even if YOLO misses faces)
+                # This is critical because InsightFace is better at detecting faces in person crops
+                if face_emb is None and fa:
+                    try:
+                        # First try on person crop directly - this should work!
+                        # InsightFace is very good at detecting faces in person crops
+                        faces = fa.get(crop_person)
+                        if faces and len(faces) > 0:
+                            f = faces[0]
+                            # Debug output
                             if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                print(f"  → ✓ Got embedding directly from person crop!")
-                        
-                        # For faces < 60px, ALSO try upscaling for potentially better quality
-                        # This improves recognition accuracy for distant faces
-                        if face_size < 60:
-                            # Extract face region and upscale it for better embedding quality
+                                print(f"  → InsightFace found {len(faces)} face(s) in person crop, has embedding: {hasattr(f, 'embedding')}")
+                            
+                            # face bbox is relative to crop_person: compute absolute width
                             if hasattr(f, 'bbox') and f.bbox is not None:
-                                bx1 = max(0, int(f.bbox[0])); by1 = max(0, int(f.bbox[1]))
-                                bx2 = min(crop_person.shape[1], int(f.bbox[2])); by2 = min(crop_person.shape[0], int(f.bbox[3]))
-                                if bx2 > bx1 and by2 > by1:
-                                    face_region = crop_person[by1:by2, bx1:bx2].copy()
-                                    if face_region.size > 0:
-                                        # Use larger upscale factor for very small faces
-                                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 45 else 2)
-                                        face_region_up = sr_enhance(face_region, factor=upscale_factor)
-                                        
-                                        # Get embedding from upscaled face (better quality)
-                                        faces_up = fa.get(face_region_up)
-                                        if faces_up and len(faces_up) > 0:
-                                            if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                                # Use upscaled embedding if we don't have one, or if it's better quality
-                                                emb_up = normalize(np.array(faces_up[0].embedding))
-                                                if face_emb is None:
-                                                    face_emb = emb_up
-                                                    if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                                        print(f"  → ✓ Got embedding from upscaled face region!")
-                                            # Update face_size from upscaled detection
-                                            if hasattr(faces_up[0], 'bbox'):
-                                                detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                                if detected_w > 0:
-                                                    face_size = detected_w
-                        
-                        # Fallback: if upscaling didn't work, try direct embedding
-                        if face_emb is None and face_size >= 60:
+                                fw = int(f.bbox[2] - f.bbox[0])
+                                face_size = max(face_size, fw)  # Use larger of YOLO or InsightFace size
+                            
+                            # ALWAYS try to get embedding directly first (even for small faces)
+                            # InsightFace embeddings work well even on small faces
                             if hasattr(f, 'embedding') and f.embedding is not None:
                                 face_emb = normalize(np.array(f.embedding))
-                        
-                        # Final fallback: if still no embedding and face is small, try upscaling
-                        if face_emb is None and face_size < 80:
-                            # Extract face region and upscale it for better quality
-                            if hasattr(f, 'bbox') and f.bbox is not None:
-                                bx1 = max(0, int(f.bbox[0])); by1 = max(0, int(f.bbox[1]))
-                                bx2 = min(crop_person.shape[1], int(f.bbox[2])); by2 = min(crop_person.shape[0], int(f.bbox[3]))
-                                if bx2 > bx1 and by2 > by1:
-                                    face_region = crop_person[by1:by2, bx1:bx2].copy()
-                                    if face_region.size > 0:
-                                        # Use larger upscale factor for very small faces
-                                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
-                                        face_region_up = sr_enhance(face_region, factor=upscale_factor)
-                                        
-                                        # Get embedding from upscaled face (better quality)
-                                        faces_up = fa.get(face_region_up)
-                                        if faces_up and len(faces_up) > 0:
-                                            if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                                face_emb = normalize(np.array(faces_up[0].embedding))
-                                            # Update face_size from upscaled detection
-                                            if hasattr(faces_up[0], 'bbox'):
-                                                detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                                if detected_w > 0:
-                                                    face_size = detected_w
-                    else:
-                        # If InsightFace didn't find face in person crop, try on expanded region around person
-                        # Expand person bbox slightly and try again
-                        expand = 30  # Increased expansion
-                        x1_exp = max(0, x1 - expand)
-                        y1_exp = max(0, y1 - expand)
-                        x2_exp = min(w, x2 + expand)
-                        y2_exp = min(h, y2 + expand)
-                        expanded_crop = frame[y1_exp:y2_exp, x1_exp:x2_exp].copy()
-                        if expanded_crop.size > 0:
-                            faces_exp = fa.get(expanded_crop)
-                            if faces_exp and len(faces_exp) > 0:
-                                f = faces_exp[0]
+                                if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                                    print(f"  → ✓ Got embedding directly from person crop!")
+                            
+                            # For faces < 60px, ALSO try upscaling for potentially better quality
+                            # This improves recognition accuracy for distant faces
+                            if face_size < 60:
+                            # Extract face region and upscale it for better embedding quality
                                 if hasattr(f, 'bbox') and f.bbox is not None:
-                                    fw = int(f.bbox[2] - f.bbox[0])
-                                    face_size = fw
+                                    bx1 = max(0, int(f.bbox[0])); by1 = max(0, int(f.bbox[1]))
+                                    bx2 = min(crop_person.shape[1], int(f.bbox[2])); by2 = min(crop_person.shape[0], int(f.bbox[3]))
+                                    if bx2 > bx1 and by2 > by1:
+                                        face_region = crop_person[by1:by2, bx1:bx2].copy()
+                                        if face_region.size > 0:
+                                            # Use larger upscale factor for very small faces
+                                            upscale_factor = 4 if face_size < 30 else (3 if face_size < 45 else 2)
+                                            face_region_up = sr_enhance(face_region, factor=upscale_factor)
+                                            
+                                            # Get embedding from upscaled face (better quality)
+                                            faces_up = fa.get(face_region_up)
+                                            if faces_up and len(faces_up) > 0:
+                                                if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
+                                                    # Use upscaled embedding if we don't have one, or if it's better quality
+                                                    emb_up = normalize(np.array(faces_up[0].embedding))
+                                                    if face_emb is None:
+                                                        face_emb = emb_up
+                                                        if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                                                            print(f"  → ✓ Got embedding from upscaled face region!")
+                                                # Update face_size from upscaled detection
+                                                if hasattr(faces_up[0], 'bbox'):
+                                                    detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
+                                                    if detected_w > 0:
+                                                        face_size = detected_w
+                            
+                            # Fallback: if upscaling didn't work, try direct embedding
+                            if face_emb is None and face_size >= 60:
                                 if hasattr(f, 'embedding') and f.embedding is not None:
                                     face_emb = normalize(np.array(f.embedding))
-                except Exception as e:
-                    # Add debug info for failures
-                    if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                        print(f"  → InsightFace error on person crop: {e}")
-                    pass
+                            
+                            # Final fallback: if still no embedding and face is small, try upscaling
+                            if face_emb is None and face_size < 80:
+                            # Extract face region and upscale it for better quality
+                                if hasattr(f, 'bbox') and f.bbox is not None:
+                                    bx1 = max(0, int(f.bbox[0])); by1 = max(0, int(f.bbox[1]))
+                                    bx2 = min(crop_person.shape[1], int(f.bbox[2])); by2 = min(crop_person.shape[0], int(f.bbox[3]))
+                                    if bx2 > bx1 and by2 > by1:
+                                        face_region = crop_person[by1:by2, bx1:bx2].copy()
+                                        if face_region.size > 0:
+                                            # Use larger upscale factor for very small faces
+                                            upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
+                                            face_region_up = sr_enhance(face_region, factor=upscale_factor)
+                                            
+                                            # Get embedding from upscaled face (better quality)
+                                            faces_up = fa.get(face_region_up)
+                                            if faces_up and len(faces_up) > 0:
+                                                if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
+                                                    face_emb = normalize(np.array(faces_up[0].embedding))
+                                                # Update face_size from upscaled detection
+                                                if hasattr(faces_up[0], 'bbox'):
+                                                    detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
+                                                    if detected_w > 0:
+                                                        face_size = detected_w
+                        else:
+                            # If InsightFace didn't find face in person crop, try on expanded region around person
+                            # Expand person bbox slightly and try again
+                            expand = 30  # Increased expansion
+                            x1_exp = max(0, x1 - expand)
+                            y1_exp = max(0, y1 - expand)
+                            x2_exp = min(w, x2 + expand)
+                            y2_exp = min(h, y2 + expand)
+                            expanded_crop = frame[y1_exp:y2_exp, x1_exp:x2_exp].copy()
+                            if expanded_crop.size > 0:
+                                faces_exp = fa.get(expanded_crop)
+                                if faces_exp and len(faces_exp) > 0:
+                                    f = faces_exp[0]
+                                    if hasattr(f, 'bbox') and f.bbox is not None:
+                                        fw = int(f.bbox[2] - f.bbox[0])
+                                        face_size = fw
+                                    if hasattr(f, 'embedding') and f.embedding is not None:
+                                        face_emb = normalize(np.array(f.embedding))
+                    except Exception as e:
+                        # Add debug info for failures
+                        if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                            print(f"  → InsightFace error on person crop: {e}")
+                        pass
 
-            # ---- ReID embedding (on person crop)
-            reid_emb = reid_encode(crop_person)
+                # ---- ReID embedding (on person crop)
+                reid_emb = reid_encode(crop_person)
 
-            # update or create tracklet
-            current_tid = None
-            if best_iouv > IOU_THRESHOLD:
-                current_tid = best_tid
-                t = tracklets[best_tid]
-                t.update(box, frame_idx, face_emb, reid_emb, face_size)
-            else:
-                current_tid = next_tid; next_tid += 1
-                t = Tracklet(current_tid, box, frame_idx)
-                t.update(box, frame_idx, face_emb, reid_emb, face_size)
-                tracklets[current_tid] = t
+                # Update tracklet with face and ReID embeddings
+                # Use vis_bbox (person detection box) for accurate visualization
+                t = tracklets[current_tid]
+                t.update(vis_bbox, frame_idx, face_emb, reid_emb, face_size)
                 
-            # Debug output for first few detections
-            if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                face_status = "✓" if face_emb is not None else "✗"
-                yolo_faces = len(face_boxes_frame)
-                person_h, person_w = crop_person.shape[:2]
-                upscale_info = ""
-                if face_size > 0 and face_size < 80:
-                    upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
-                    upscale_info = f" (upscaled {upscale_factor}x for better quality)"
-                print(f"[Frame {frame_idx}] Tracklet {current_tid}: "
-                      f"YOLO faces: {yolo_faces}, Face detected: {face_status} (size: {face_size}px){upscale_info}, "
-                      f"Person crop: {person_w}x{person_h}px, ReID: {'✓' if reid_emb is not None else '✗'}")
-                if face_emb is None:
-                    if yolo_faces == 0:
-                        print(f"  → No YOLO faces found, trying InsightFace on person crop ({person_w}x{person_h}px)...")
+                # Debug output for first few detections
+                if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                    face_status = "✓" if face_emb is not None else "✗"
+                    yolo_faces = len(face_boxes_frame)
+                    person_h, person_w = crop_person.shape[:2]
+                    upscale_info = ""
+                    if face_size > 0 and face_size < 80:
+                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
+                        upscale_info = f" (upscaled {upscale_factor}x for better quality)"
+                    print(f"[Frame {frame_idx}] Tracklet {current_tid}: "
+                          f"YOLO faces: {yolo_faces}, Face detected: {face_status} (size: {face_size}px){upscale_info}, "
+                          f"Person crop: {person_w}x{person_h}px, ReID: {'✓' if reid_emb is not None else '✗'}")
+                    if face_emb is None:
+                        if yolo_faces == 0:
+                            print(f"  → No YOLO faces found, trying InsightFace on person crop ({person_w}x{person_h}px)...")
+                        else:
+                            print(f"  → YOLO found {yolo_faces} face(s) but InsightFace failed to extract embedding!")
+                    if face_emb is not None:
+                        print(f"  → ✓ Face successfully detected and embedded! (size: {face_size}px)")
+        
+        # Process person boxes that weren't matched to ByteTrack tracks (fallback for missed detections)
+        # This ensures all detected people are visualized, even if ByteTrack didn't track them
+        if USE_BYTETRACK and len(tracked_objects) > 0:
+            # Find person boxes that weren't matched to any ByteTrack track
+            matched_person_boxes = set()
+            for track in tracked_objects:
+                track_id = int(track.track_id)
+                x1_bt, y1_bt, x2_bt, y2_bt = int(track.tlbr[0]), int(track.tlbr[1]), int(track.tlbr[2]), int(track.tlbr[3])
+                if x2_bt <= x1_bt or y2_bt <= y1_bt:
+                    continue
+                byte_track_bbox = (x1_bt, y1_bt, x2_bt, y2_bt)
+                # Find matching person box
+                for box in person_boxes:
+                    if iou(byte_track_bbox, box) > 0.2:
+                        matched_person_boxes.add(box)
+            
+            # Process unmatched person boxes with IOU-based matching
+            for box in person_boxes:
+                if box in matched_person_boxes:
+                    continue  # Already processed by ByteTrack
+                
+                # Use IOU-based matching for unmatched person boxes
+                x1,y1,x2,y2 = box
+                crop_person = frame[y1:y2, x1:x2].copy()
+                
+                if crop_person.size == 0 or crop_person.shape[0] == 0 or crop_person.shape[1] == 0:
+                    continue
+                
+                best_tid, best_iouv = None, 0
+                for tid, t in tracklets.items():
+                    if len(t.bboxes) == 0:
+                        continue
+                    val = iou(box, t.bboxes[-1])
+                    if val > best_iouv:
+                        best_tid, best_iouv = tid, val
+                
+                if best_iouv > IOU_THRESHOLD:
+                    current_tid = best_tid
+                    tracklets[current_tid].bboxes.append(box)
+                    tracklets[current_tid].last_frame = frame_idx
+                else:
+                    # Create new tracklet for unmatched person
+                    current_tid = next_tid
+                    next_tid += 1
+                    tracklets[current_tid] = Tracklet(current_tid, box, frame_idx)
+                
+                # Extract face and ReID for this unmatched person box
+                face_emb = None
+                face_size = 0
+                
+                # Try face detection
+                matched_face = None
+                for fb in face_boxes_frame:
+                    if box_inside(fb, box) or iou(fb, box) > 0.1:
+                        matched_face = fb
+                        break
+                
+                if matched_face is not None:
+                    fx1,fy1,fx2,fy2 = matched_face
+                    fx1,fy1,fx2,fy2 = max(0,fx1),max(0,fy1),min(w,fx2),min(h,fy2)
+                    face_crop = frame[fy1:fy2, fx1:fx2].copy()
+                    face_size = (fx2-fx1)
+                    if fa:
+                        try:
+                            faces = fa.get(face_crop)
+                            if faces and len(faces) > 0:
+                                if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
+                                    face_emb = normalize(np.array(faces[0].embedding))
+                        except:
+                            pass
+                
+                if face_emb is None and fa:
+                    try:
+                        faces = fa.get(crop_person)
+                        if faces and len(faces) > 0:
+                            f = faces[0]
+                            if hasattr(f, 'embedding') and f.embedding is not None:
+                                face_emb = normalize(np.array(f.embedding))
+                    except:
+                        pass
+                
+                reid_emb = reid_encode(crop_person)
+                t = tracklets[current_tid]
+                t.update(box, frame_idx, face_emb, reid_emb, face_size)
+        
+        # Fallback: If ByteTrack is not available or no tracked objects, use IOU-based matching
+        if not USE_BYTETRACK or len(tracked_objects) == 0:
+            # Process each person box with IOU-based matching
+            for box in person_boxes:
+                x1,y1,x2,y2 = box
+                crop_person = frame[y1:y2, x1:x2].copy()
+                
+                # IOU-based matching (original logic)
+                best_tid, best_iouv = None, 0
+                for tid, t in tracklets.items():
+                    val = iou(box, t.bboxes[-1])
+                    if val > best_iouv:
+                        best_tid, best_iouv = tid, val
+                
+                if best_iouv > IOU_THRESHOLD:
+                    current_tid = best_tid
+                else:
+                    current_tid = next_tid
+                    next_tid += 1
+                    tracklets[current_tid] = Tracklet(current_tid, box, frame_idx)
+                
+                # Face and ReID extraction (same as above)
+                face_emb = None
+                face_size = 0
+                
+                # Method 1: Try YOLO face boxes first
+                matched_face = None
+                for fb in face_boxes_frame:
+                    if box_inside(fb, box) or iou(fb, box) > 0.1:
+                        matched_face = fb
+                        break
+                
+                if matched_face is not None:
+                    fx1,fy1,fx2,fy2 = matched_face
+                    fx1,fy1,fx2,fy2 = max(0,fx1),max(0,fy1),min(w,fx2),min(h,fy2)
+                    face_crop = frame[fy1:fy2, fx1:fx2].copy()
+                    face_size = (fx2-fx1)
+                    
+                    if face_size < 60:
+                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 45 else 2)
+                        face_crop_up = sr_enhance(face_crop, factor=upscale_factor)
+                        if fa:
+                            try:
+                                faces_up = fa.get(face_crop_up)
+                                if faces_up and len(faces_up) > 0:
+                                    if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
+                                        face_emb = normalize(np.array(faces_up[0].embedding))
+                                    if hasattr(faces_up[0], 'bbox'):
+                                        detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
+                                        if detected_w > 0:
+                                            face_size = detected_w
+                            except Exception:
+                                pass
                     else:
-                        print(f"  → YOLO found {yolo_faces} face(s) but InsightFace failed to extract embedding!")
-                if face_emb is not None:
-                    print(f"  → ✓ Face successfully detected and embedded! (size: {face_size}px)")
+                        if fa:
+                            try:
+                                faces = fa.get(face_crop)
+                                if faces and len(faces) > 0:
+                                    if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
+                                        face_emb = normalize(np.array(faces[0].embedding))
+                                    if hasattr(faces[0], 'bbox'):
+                                        detected_w = int(faces[0].bbox[2] - faces[0].bbox[0])
+                                        if detected_w > 0:
+                                            face_size = detected_w
+                            except Exception:
+                                pass
+                
+                # Method 2: Always try InsightFace on person crop
+                if face_emb is None and fa:
+                    try:
+                        faces = fa.get(crop_person)
+                        if faces and len(faces) > 0:
+                            f = faces[0]
+                            if hasattr(f, 'bbox') and f.bbox is not None:
+                                fw = int(f.bbox[2] - f.bbox[0])
+                                face_size = max(face_size, fw)
+                            if hasattr(f, 'embedding') and f.embedding is not None:
+                                face_emb = normalize(np.array(f.embedding))
+                    except Exception:
+                        pass
+                
+                # ReID embedding
+                reid_emb = reid_encode(crop_person)
+                
+                # Update tracklet
+                t = tracklets[current_tid]
+                t.update(box, frame_idx, face_emb, reid_emb, face_size)
 
     # --------------------------
     # Verification logic (unchanged)
@@ -627,38 +1376,56 @@ while True:
                 print(f"[REJECTED] Tracklet {tid} NO FACE DETECTED - Cannot verify without face recognition (ReID disabled for face-only reference)")
                 print(f"  → Face embeddings: {len(t.face_embs)}, ReID embeddings: {len(t.reid_embs)}")
 
-            if t.verified:
-                # start tracker (use legacy API for compatibility)
-                x1,y1,x2,y2 = t.bboxes[-1]
-                wbox, hbox = x2-x1, y2-y1
-                try:
-                    # Try legacy tracker API first (OpenCV 4.5+)
-                    if hasattr(cv2, 'legacy') and hasattr(cv2.legacy, 'TrackerCSRT_create'):
-                        tracker = cv2.legacy.TrackerCSRT_create()
-                    elif hasattr(cv2, 'TrackerCSRT_create'):
-                        tracker = cv2.TrackerCSRT_create()
-                    else:
-                        # Fallback to KCF tracker if CSRT not available
-                        tracker = cv2.TrackerKCF_create() if hasattr(cv2, 'TrackerKCF_create') else None
-                    
-                    if tracker is not None:
-                        tracker.init(frame, (x1,y1,wbox,hbox))
-                        t.tracker = tracker
-                except Exception as e:
-                    # Tracker initialization failed - continue without tracker
-                    print(f"Warning: Tracker init failed for tracklet {tid}: {e}")
-                    t.tracker = None
+            # ByteTrack handles tracking automatically, no need for manual tracker initialization
 
     # --------------------------
     # Visualization
     # --------------------------
     vis = frame.copy()
+    
+    # Draw tracked persons
     for tid, t in tracklets.items():
+        if len(t.bboxes) == 0:
+            continue  # Skip tracklets with no bboxes
+        
         x1,y1,x2,y2 = t.bboxes[-1]
+        
+        # Validate bbox coordinates
+        if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+            continue  # Skip invalid bboxes
+        
+        # Ensure bbox is within frame bounds
+        x1 = max(0, min(x1, w-1))
+        y1 = max(0, min(y1, h-1))
+        x2 = max(x1+1, min(x2, w))
+        y2 = max(y1+1, min(y2, h))
+        
         color = (0,255,0) if t.verified else (0,0,255)
         cv2.rectangle(vis, (x1,y1), (x2,y2), color, 2)
-        cv2.putText(vis, f"ID:{tid}{' V' if t.verified else ''}",
-                    (x1, y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        cv2.putText(vis, f"Person ID:{tid}{' V' if t.verified else ''}",
+                    (x1, max(15, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    # Draw tracked objects (laptops, phones, bags, etc.)
+    for oid, obj_track in object_tracklets.items():
+        if frame_idx - obj_track.last_frame > OBJ_TRACK_MAX_AGE:
+            continue  # Skip old tracks
+        
+        bbox = obj_track.get_latest_bbox()
+        if bbox is None:
+            continue
+        
+        x1, y1, x2, y2 = bbox
+        # Validate bbox
+        if x2 <= x1 or y2 <= y1 or x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+            continue
+        
+        # Use different color for objects (cyan)
+        obj_color = (255, 255, 0)  # Cyan
+        cv2.rectangle(vis, (x1, y1), (x2, y2), obj_color, 2)
+        avg_conf = obj_track.get_avg_confidence()
+        label = f"{obj_track.class_name} ID:{oid} {avg_conf:.2f}"
+        cv2.putText(vis, label, (x1, max(15, y1-8)), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, obj_color, 2)
 
     cv2.imshow("Hybrid Face+ReID CPU Pipeline (YOLO-face integrated)", vis)
     if cv2.waitKey(1) & 0xFF == ord("q"):
