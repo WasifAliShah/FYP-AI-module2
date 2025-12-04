@@ -10,6 +10,62 @@ import torch
 import torchvision.transforms as T
 from torchvision.models import resnet50
 from ultralytics import YOLO
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, NamedVector
+from dotenv import load_dotenv
+import os
+import qdrant_collections  # for collection constants
+
+# Load environment variables
+load_dotenv()
+# 1. Initialize the client
+# Try to be resilient: support QDRANT_URL (http) or host+port for gRPC
+from urllib.parse import urlparse
+
+client = None
+qdrant_url = os.environ.get("QDRANT_URL")
+qdrant_host = os.environ.get("QDRANT_HOST")
+qdrant_port = os.environ.get("QDRANT_PORT") or os.environ.get("QDRANT_GRPC_PORT")
+
+try:
+    if qdrant_url:
+        parsed = urlparse(qdrant_url)
+        # If the URL port is the gRPC port (6334) prefer gRPC transport to avoid sending HTTP to gRPC
+        if parsed.port == 6334:
+            host = parsed.hostname or "localhost"
+            port = parsed.port
+            # prefer_grpc=True forces the client to use gRPC transport
+            client = QdrantClient(host=host, port=port, prefer_grpc=True)
+            # perform health check before printing success
+            client.get_collections()
+            print(f"Connected to Qdrant (gRPC) at {host}:{port}")
+        else:
+            # Default: use HTTP/REST URL
+            client = QdrantClient(url=qdrant_url)
+            client.get_collections()
+            print(f"Connected to Qdrant (HTTP) at {qdrant_url}")
+    elif qdrant_host and qdrant_port:
+        # assume this is gRPC configuration
+        client = QdrantClient(host=qdrant_host, port=int(qdrant_port), prefer_grpc=True)
+        client.get_collections()
+        print(f"Connected to Qdrant (gRPC) at {qdrant_host}:{qdrant_port}")
+    else:
+        # Fallback to defaults (client will try localhost:6333 HTTP)
+        client = QdrantClient()
+        client.get_collections()
+        print("Connected to Qdrant with default settings (HTTP)")
+
+    # Quick health check
+    client.get_collections()
+except Exception as e:
+    print("Failed to connect to Qdrant:", e)
+
+try:
+    # create_qdrant_schema is defined in qdrant_collections.py; call it qualified
+    qdrant_collections.create_qdrant_schema(client)
+    print("Qdrant schema created successfully.")
+except Exception as e:
+    print("Failed to create Qdrant schema:", e)
 
 # InsightFace
 try:
@@ -53,8 +109,8 @@ except Exception as e:
 # ----------------------
 # CONFIG (CPU OPTIMIZED)
 # ----------------------
-VIDEO_PATH = "new_video5.mp4"
-REF_FACE_PATHS = ["new_wasif1.jpg"]
+VIDEO_PATH = "combined.mp4"
+REF_FACE_PATHS = ["zeeshan.jpg"]
 
 YOLO_PERSON_MODEL = "yolov8m.pt"        # your person model
 YOLO_FACE_MODEL = "yolov8m-face.pt"     # recommended: yolov8n-face or yolov8m-face
@@ -279,6 +335,16 @@ if len(ref_face_embs) > 0:
     USE_REID_VERIFICATION = False
 print("=" * 40 + "\n")
 
+# ===== DEBUG: Identify embedding dimensions =====
+FACE_EMBEDDING_DIM = len(ref_face_embs[0]) if len(ref_face_embs) > 0 else None
+REID_EMBEDDING_DIM = len(ref_reid_embs[0]) if len(ref_reid_embs) > 0 else None
+
+print("=" * 40)
+print("🔍 EMBEDDING DIMENSIONS DETECTED:")
+print(f"  Face embedding (InsightFace): {FACE_EMBEDDING_DIM}D")
+print(f"  ReID embedding (TorchReID OSNet): {REID_EMBEDDING_DIM}D")
+print("=" * 40 + "\n")
+
 # ----------------------
 # Helper functions
 # ----------------------
@@ -399,6 +465,122 @@ def apply_nms(boxes, scores, iou_threshold=0.5):
         return []
     
     return indices.flatten().tolist()
+
+# ----------------------
+# Qdrant insertion function for verified tracklets
+# ----------------------
+import uuid
+from datetime import datetime
+
+def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, frame_rate=30.0):
+    """
+    Insert a verified tracklet into Qdrant person_tracks collection.
+    
+    Stores averaged face and ReID embeddings with metadata for similarity search.
+    
+    Args:
+        client: QdrantClient instance
+        tracklet: Tracklet object with verified=True, avg face/reid embeddings
+        video_id: Video ID from PostgreSQL videos table
+        segment_id: Optional segment ID for video_segments table link
+        frame_rate: Video frame rate for time calculations
+    
+    Returns:
+        bool: True if insertion succeeded, False otherwise
+    """
+    if not tracklet.verified or not client:
+        return False
+    
+    try:
+        # Get averaged embeddings
+        face_avg = tracklet.avg_face()
+        reid_avg = tracklet.avg_reid()
+        
+        if face_avg is None or reid_avg is None:
+            return False
+        
+        # Generate unique ID for this tracklet entry
+        point_id = str(uuid.uuid4())
+        
+        # Calculate time range (start_frame and end_frame from tracklet.bboxes timeline)
+        start_frame = 0  # First frame this tracklet appeared
+        end_frame = tracklet.last_frame if hasattr(tracklet, 'last_frame') else 0
+        num_frames = end_frame - start_frame
+        
+        # Estimate time in seconds using frame rate
+        start_time_sec = start_frame / max(frame_rate, 1.0)
+        end_time_sec = end_frame / max(frame_rate, 1.0)
+        
+        # Format as HH:MM:SS
+        def seconds_to_hms(secs):
+            h = int(secs // 3600)
+            m = int((secs % 3600) // 60)
+            s = int(secs % 60)
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        
+        start_time_str = seconds_to_hms(start_time_sec)
+        end_time_str = seconds_to_hms(end_time_sec)
+        
+        # Build payload per spec (NO camera_id)
+        payload = {
+            "video_id": video_id,
+            "track_id": tracklet.id,
+            "start_time": start_time_str,
+            "end_time": end_time_str,
+            "num_frames": num_frames,
+            "avg_confidence": 0.85,  # placeholder, can extract from tracklet if available
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        # Add optional segment_id if provided
+        if segment_id is not None:
+            payload["segment_id"] = segment_id
+        
+        # Optional fields (set None/empty for now, extend later with attribute detection)
+        payload["person_gender"] = None
+        payload["upper_color"] = None
+        payload["lower_color"] = None
+        payload["object_carried"] = []
+        
+        # Convert embeddings to lists for Qdrant
+        face_vec = face_avg.tolist() if isinstance(face_avg, np.ndarray) else list(face_avg)
+        reid_vec = reid_avg.tolist() if isinstance(reid_avg, np.ndarray) else list(reid_avg)
+        
+        # For multi_vec (CLIP placeholder): pad 512D to 768D with zeros
+        # (Schema expects 768D; once CLIP is implemented, replace with actual CLIP embedding)
+        def pad_to_768(vec_512):
+            """Pad 512D vector to 768D by appending zeros."""
+            vec_list = vec_512.tolist() if isinstance(vec_512, np.ndarray) else list(vec_512)
+            return vec_list + [0.0] * (768 - len(vec_list))
+        
+        multi_vec = pad_to_768(face_avg)
+        
+        # Build vectors dict for NamedVectors (per spec: face_vec 512D, reid_vec 512D, multi_vec 768D)
+        vectors = {
+            "face_vec": face_vec,          # 512D (InsightFace)
+            "reid_vec": reid_vec,          # 512D (TorchReID)
+            "multi_vec": multi_vec,        # 768D (CLIP placeholder, padded from face_vec)
+        }
+        
+        # Insert into Qdrant
+        from qdrant_client.models import PointStruct
+        point = PointStruct(
+            id=point_id,
+            vector=vectors,  # NamedVectors
+            payload=payload
+        )
+        
+        client.upsert(
+            collection_name="person_tracks",
+            points=[point]
+        )
+        
+        print(f"✅ Inserted tracklet {tracklet.id} to Qdrant (ID: {point_id})")
+        return True
+        
+    except Exception as e:
+        print(f"⚠ Failed to insert tracklet {tracklet.id} to Qdrant: {e}")
+        return False
 
 # ----------------------
 # Tracklet class (for persons)
@@ -1367,6 +1549,9 @@ while True:
                 if face_ok:
                     t.verified = True
                     print(f"[VERIFIED] Tracklet {tid} via FACE RECOGNITION  face_score={face_score:.4f}  face_size={face_width}px  face_embs={len(t.face_embs)}")
+                    # Insert to Qdrant for vector database storage
+                    if client:
+                        insert_tracklet_to_qdrant(client, t, video_id=1, segment_id=None, frame_rate=30.0)
                 else:
                     # Face detected but doesn't match - do NOT verify (ReID disabled for face-only refs)
                     print(f"[REJECTED] Tracklet {tid} face detected but NO MATCH (score={face_score:.4f}) - ReID disabled for face-only reference")
