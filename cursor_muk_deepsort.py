@@ -512,20 +512,17 @@ def detect_person_attributes(crop, face_crop=None):
         "has_hat": bool,       # Detected hat or head covering
         "has_hood": bool,      # Detected hood on clothing
         "has_glasses": bool,   # Detected glasses/sunglasses
-        "has_backpack": bool,  # Detected backpack
     }
     
     Uses conservative heuristics to minimize false positives:
     - hat: Detects distinct dark/light regions at top of person crop
     - hood: Detects pointed/curved top region with strong edge definition
     - glasses: Looks for symmetric dark oval regions in face area
-    - backpack: Detects large rectangular region on back/shoulders
     """
     attributes = {
         "has_hat": False,
         "has_hood": False,
         "has_glasses": False,
-        "has_backpack": False,
     }
     
     if crop is None or crop.size == 0:
@@ -601,38 +598,6 @@ def detect_person_attributes(crop, face_crop=None):
                     # HIGH threshold: >25% very dark pixels in eye region
                     if dark_ratio > 0.25:
                         attributes["has_glasses"] = True
-        
-        # === BACKPACK DETECTION (STRICT) ===
-        # Look for LARGE rectangular dark region in middle (simulating backpack)
-        mid_region = crop[crop_h // 5:crop_h * 4 // 5, :]
-        if mid_region.size > 0:
-            gray_mid = cv2.cvtColor(mid_region, cv2.COLOR_BGR2GRAY)
-            # Threshold to find DARK regions only
-            _, binary = cv2.threshold(gray_mid, 120, 255, cv2.THRESH_BINARY_INV)
-            
-            # Find contours (potential backpack shapes)
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Look for ONE LARGE rectangular contour (actual backpack)
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                x, y, w, h = cv2.boundingRect(cnt)
-                
-                # Backpack criteria: LARGE area, rectangular shape, right proportions
-                # Minimum area: at least 5% of mid region
-                min_area_threshold = mid_region.size * 0.05
-                aspect_ratio = w / (h + 1)
-                
-                # Backpack is roughly rectangular: 0.5 < aspect < 2.0, and LARGE
-                if area > min_area_threshold and 0.4 < aspect_ratio < 2.5:
-                    # Check if it's positioned like a backpack (centered or right side)
-                    region_center_x = x + w // 2
-                    # Backpack typically on back/shoulders - right/center area
-                    if region_center_x > mid_region.shape[1] * 0.3:
-                        # Final check: should be reasonably tall (not just a small blob)
-                        if h > mid_region.shape[0] * 0.2:
-                            attributes["has_backpack"] = True
-                            break
         
         return attributes
         
@@ -1232,7 +1197,6 @@ class Tracklet:
             "has_hat": deque(maxlen=20),       # Boolean: person wearing hat
             "has_hood": deque(maxlen=20),      # Boolean: person wearing hood
             "has_glasses": deque(maxlen=20),   # Boolean: person wearing glasses
-            "has_backpack": deque(maxlen=20),  # Boolean: person wearing backpack
         }
         
         self.verified = False
@@ -2906,13 +2870,6 @@ def query_tracklets_by_text(text_prompt, top_k=5):
                     boosted_score += 0.18
                 else:
                     boosted_score -= 0.02
-
-            # Backpack
-            if keyword_hit(["backpack", "wearing backpack", "has backpack", "with backpack"]):
-                if attributes.get("has_backpack"):
-                    boosted_score += 0.16
-                else:
-                    boosted_score -= 0.02
             
             # Small boost for verified tracklets (reference person match)
             if "verified" in query_lower and verified:
@@ -2976,8 +2933,6 @@ def query_tracklets_by_text(text_prompt, top_k=5):
                 detected_attrs.append("🧥 Hood")
             if attributes.get("has_glasses"):
                 detected_attrs.append("👓 Glasses")
-            if attributes.get("has_backpack"):
-                detected_attrs.append("🎒 Backpack")
             
             if detected_attrs:
                 print(f"   Attributes: {', '.join(detected_attrs)}")
