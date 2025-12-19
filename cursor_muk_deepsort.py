@@ -389,15 +389,19 @@ def get_dominant_color(crop):
         s_mean = float(np.mean(S))
 
         # FIRST: Check for BROWN before white (brown can look desaturated)
-        # Brown detection in darker warm hues
-        brown_mask = ((H < 30) | (H > 160)) & (V < 140) & (S > 25)
+        # Brown detection in darker warm hues - STRICT to avoid false positives
+        # Require higher saturation and narrower hue range for brown
+        brown_mask = ((H < 20) | (H > 165)) & (V >= 40) & (V < 130) & (S > 40)  # Stricter: narrower hue, higher sat, not too dark
         brown_ratio = float(np.sum(brown_mask) / H.size) if H.size > 0 else 0
         # Also detect tan/light brown: warm hues with moderate saturation
-        tan_mask = ((H < 30) | (H > 160)) & (V >= 140) & (V < 190) & (S >= 30) & (S < 80)
+        tan_mask = ((H < 20) | (H > 165)) & (V >= 130) & (V < 180) & (S >= 35) & (S < 85)
         tan_ratio = float(np.sum(tan_mask) / H.size) if H.size > 0 else 0
         
-        # If significant brown/tan pixels, return brown BEFORE white check
-        if brown_ratio > 0.25 or tan_ratio > 0.25:
+        # Only return brown if VERY dominant (>40%) to avoid false positives from shadows
+        if brown_ratio > 0.40 or tan_ratio > 0.40:
+            return "brown"
+        # Or if both together are strong and mean saturation suggests brown
+        if (brown_ratio + tan_ratio) > 0.50 and s_mean > 35 and 50 < v_mean < 160:
             return "brown"
 
         # PRIORITY 1: BLACK detection (very dark)
@@ -1134,6 +1138,7 @@ def insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None
             "video_id": video_id,
             "track_id": obj_track.id,
             "object_type": obj_track.class_name,
+            "object_color": obj_track.get_dominant_color(),  # Add color
             "start_time": start_time_str,
             "end_time": end_time_str,
             "num_frames": num_frames,
@@ -1144,10 +1149,19 @@ def insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None
         if segment_id is not None:
             payload["segment_id"] = segment_id
         
-        # Create zero embeddings for object_vec and multi_vec (768D each)
-        # In future, could add CLIP embeddings of the object crops here
-        object_vec = np.zeros(768, dtype=np.float32).tolist()
-        multi_vec = np.zeros(768, dtype=np.float32).tolist()
+        # Use averaged CLIP embeddings if available, otherwise zeros
+        avg_clip_emb = obj_track.avg_clip()
+        if avg_clip_emb is not None:
+            # Pad to 768D if needed
+            if len(avg_clip_emb) < 768:
+                object_vec = np.concatenate([avg_clip_emb, np.zeros(768 - len(avg_clip_emb), dtype=np.float32)]).tolist()
+            else:
+                object_vec = avg_clip_emb[:768].tolist()
+            multi_vec = object_vec  # Use same embedding for multi_vec
+        else:
+            # Fallback to zeros if no CLIP embeddings collected
+            object_vec = np.zeros(768, dtype=np.float32).tolist()
+            multi_vec = np.zeros(768, dtype=np.float32).tolist()
         
         vectors = {
             "object_vec": object_vec,  # 768D (placeholder for future CLIP embeddings)
@@ -1326,9 +1340,11 @@ class ObjectTracklet:
         self.last_frame = frame_idx
         self.first_frame = frame_idx
         self.velocity = None  # Track velocity for motion prediction
+        self.clip_embs = []  # CLIP embeddings of object crops for semantic search
+        self.colors = deque(maxlen=20)  # Track detected object colors
         self.inserted = False  # Track if already inserted to Qdrant
 
-    def update(self, bbox, confidence, frame_idx, class_name=None):
+    def update(self, bbox, confidence, frame_idx, class_name=None, clip_emb=None, color=None):
         # Update velocity if we have previous bbox
         if len(self.bboxes) > 0:
             prev_bbox = self.bboxes[-1]
@@ -1341,6 +1357,14 @@ class ObjectTracklet:
         self.bboxes.append(bbox)
         self.confidences.append(confidence)
         self.last_frame = frame_idx
+        
+        # Store CLIP embedding if provided
+        if clip_emb is not None:
+            self.clip_embs.append(clip_emb)
+        
+        # Store color if provided
+        if color is not None:
+            self.colors.append(color)
         
         # Update class vote to stabilize label - but respect locked classes
         if class_name:
@@ -1379,6 +1403,22 @@ class ObjectTracklet:
         if self.confidences:
             return np.mean(list(self.confidences))
         return 0.0
+    
+    def avg_clip(self):
+        """Get average CLIP embedding for semantic search"""
+        if not self.clip_embs:
+            return None
+        avg = np.mean(self.clip_embs, axis=0)
+        return avg / (np.linalg.norm(avg) + 1e-8)  # Normalize
+    
+    def get_dominant_color(self):
+        """Get most frequent color (voting system)"""
+        if not self.colors:
+            return None
+        color_counts = {}
+        for color in self.colors:
+            color_counts[color] = color_counts.get(color, 0) + 1
+        return max(color_counts, key=color_counts.get)
     
     def predict_position(self, frames_ahead=1):
         """Predict future position based on velocity"""
@@ -1668,6 +1708,35 @@ while True:
             
             current_detections = consolidated_detections
             
+            # Generate CLIP embeddings and detect colors for each detected object
+            object_clip_embeddings = {}  # Maps (class_name, bbox) -> clip_embedding
+            object_colors = {}  # Maps (class_name, bbox) -> color
+            if USE_CLIP and clip_model is not None and len(current_detections) > 0:
+                for class_name, bbox, conf in current_detections:
+                    x1, y1, x2, y2 = bbox
+                    obj_crop = frame[y1:y2, x1:x2]
+                    if obj_crop.size > 0:
+                        try:
+                            obj_pil = Image.fromarray(cv2.cvtColor(obj_crop, cv2.COLOR_BGR2RGB))
+                            obj_input = clip_preprocess(obj_pil).unsqueeze(0).to(DEVICE)
+                            with torch.no_grad():
+                                obj_emb = clip_model.encode_image(obj_input).cpu().numpy().flatten()
+                                # Normalize
+                                obj_emb = obj_emb / (np.linalg.norm(obj_emb) + 1e-8)
+                                object_clip_embeddings[(class_name, bbox)] = obj_emb
+                        except Exception as e:
+                            if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                                print(f"[CLIP] Failed to encode object {class_name}: {e}")
+                        
+                        # Detect object color
+                        try:
+                            obj_color = get_dominant_color(obj_crop)
+                            if obj_color:
+                                object_colors[(class_name, bbox)] = obj_color
+                        except Exception as e:
+                            if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                                print(f"[Color] Failed to detect color for {class_name}: {e}")
+            
             # Use ByteTrack for object tracking (handles sudden movements better)
             if USE_BYTETRACK and byte_tracker_objects is not None:
                 try:
@@ -1771,10 +1840,19 @@ while True:
                                     continue
                         
                         # Update or create object tracklet with ByteTrack ID
+                        # Get CLIP embedding and color for this detection if available
+                        clip_emb = object_clip_embeddings.get((class_name, bbox_to_store), None)
+                        obj_color = object_colors.get((class_name, bbox_to_store), None)
+                        
                         if track_id in object_tracklets:
-                            object_tracklets[track_id].update(bbox_to_store, conf, frame_idx, class_name=class_name)
+                            object_tracklets[track_id].update(bbox_to_store, conf, frame_idx, class_name=class_name, clip_emb=clip_emb, color=obj_color)
                         else:
-                            object_tracklets[track_id] = ObjectTracklet(track_id, class_name, bbox_to_store, conf, frame_idx)
+                            obj_tracklet = ObjectTracklet(track_id, class_name, bbox_to_store, conf, frame_idx)
+                            if clip_emb is not None:
+                                obj_tracklet.clip_embs.append(clip_emb)
+                            if obj_color is not None:
+                                obj_tracklet.colors.append(obj_color)
+                            object_tracklets[track_id] = obj_tracklet
                     
                     # Clean up old tracks
                     tracks_to_remove = []
@@ -1829,9 +1907,18 @@ while True:
                                 best_match_id = oid
                     
                     if best_match_id is not None:
-                        object_tracklets[best_match_id].update(bbox, conf, frame_idx, class_name=class_name)
+                        clip_emb = object_clip_embeddings.get((class_name, bbox), None)
+                        obj_color = object_colors.get((class_name, bbox), None)
+                        object_tracklets[best_match_id].update(bbox, conf, frame_idx, class_name=class_name, clip_emb=clip_emb, color=obj_color)
                     else:
-                        object_tracklets[next_obj_id] = ObjectTracklet(next_obj_id, class_name, bbox, conf, frame_idx)
+                        obj_tracklet = ObjectTracklet(next_obj_id, class_name, bbox, conf, frame_idx)
+                        clip_emb = object_clip_embeddings.get((class_name, bbox), None)
+                        obj_color = object_colors.get((class_name, bbox), None)
+                        if clip_emb is not None:
+                            obj_tracklet.clip_embs.append(clip_emb)
+                        if obj_color is not None:
+                            obj_tracklet.colors.append(obj_color)
+                        object_tracklets[next_obj_id] = obj_tracklet
                         next_obj_id += 1
         
     # Update object tracker on non-object-detection frames (maintain tracking continuity)
@@ -2742,6 +2829,277 @@ print(f"Total tracklets processed: {len(tracklets)}")
 print(f"Verified tracklets: {sum(1 for t in tracklets.values() if t.verified)}")
 print("="*80 + "\n")
 
+def query_objects_by_text(text_prompt, top_k=5):
+    """
+    Query Qdrant for OBJECTS matching a text description using CLIP embeddings.
+    Searches the object_tracks collection for laptops, phones, bags, etc. using semantic search.
+    """
+    if not client:
+        print("❌ Qdrant client not connected")
+        return []
+
+    try:
+        print(f"\n🔍 Searching for objects: '{text_prompt}'")
+        query_lower = text_prompt.lower()
+        
+        # Check if we have CLIP embeddings in object_tracks
+        # If all embeddings are zeros, fall back to keyword matching
+        test_point, _ = client.scroll(
+            collection_name="object_tracks",
+            limit=1,
+            with_vectors=True,
+        )
+        
+        use_clip_search = False
+        if test_point:
+            vec = test_point[0].vector.get("object_vec", []) if hasattr(test_point[0], "vector") else []
+            # Check if embedding is non-zero
+            if isinstance(vec, list) and len(vec) > 0 and sum(abs(x) for x in vec) > 0.01:
+                use_clip_search = True
+        
+        if use_clip_search and USE_CLIP and clip_model is not None:
+            # Semantic search using CLIP embeddings
+            print(f"   🔮 Using semantic CLIP search")
+            
+            # Encode text query
+            text_token = clip.tokenize([text_prompt]).to(DEVICE)
+            with torch.no_grad():
+                text_emb = clip_model.encode_text(text_token).cpu().numpy().flatten()
+                text_emb = text_emb / (np.linalg.norm(text_emb) + 1e-8)  # Normalize
+            
+            # Pad to 768D if needed
+            if len(text_emb) < 768:
+                text_vec = np.concatenate([text_emb, np.zeros(768 - len(text_emb), dtype=np.float32)])
+            else:
+                text_vec = text_emb[:768]
+            
+            # Scroll all objects and compute similarities manually
+            points, _ = client.scroll(
+                collection_name="object_tracks",
+                limit=1000,
+                with_payload=True,
+                with_vectors=True,
+            )
+            
+            if not points:
+                print("   ⚠ No matching objects found")
+                return []
+            
+            # Calculate similarities with class-prior boosting
+            # Define query intent flags (object types)
+            q_is_phone = any(k in query_lower for k in ["phone", "mobile", "cell", "smartphone", "iphone"])
+            q_is_laptop = any(k in query_lower for k in ["laptop", "computer", "notebook", "macbook", "pc"])
+            q_is_bag = any(k in query_lower for k in ["bag", "backpack", "handbag", "rucksack", "pack"]) and not q_is_laptop and not q_is_phone
+            q_is_suitcase = any(k in query_lower for k in ["suitcase", "luggage", "trolley", "carry-on"]) and not q_is_laptop and not q_is_phone
+            
+            # Define color query flags
+            q_color = None
+            color_keywords = ["black", "white", "red", "blue", "green", "yellow", "orange", "purple", "pink", "brown", "gray", "grey", "silver", "gold"]
+            for color_kw in color_keywords:
+                if color_kw in query_lower:
+                    q_color = color_kw if color_kw != "grey" else "gray"  # Normalize grey->gray
+                    break
+
+            similarities = []
+            for p in points:
+                if not hasattr(p, "vector") or p.vector is None:
+                    continue
+                
+                vec = None
+                if isinstance(p.vector, dict):
+                    vec = p.vector.get("object_vec") or p.vector.get("multi_vec")
+                else:
+                    vec = p.vector
+                
+                if vec is None:
+                    continue
+                
+                vec_np = np.array(vec, dtype=np.float32)
+                if vec_np.size == 0 or vec_np.shape[0] != text_vec.shape[0]:
+                    continue
+                
+                # Check if vector is non-zero (has real embeddings)
+                if np.sum(np.abs(vec_np)) < 0.01:
+                    continue  # Skip zero embeddings
+                
+                # Compute cosine similarity
+                sim = np.dot(text_vec, vec_np) / (np.linalg.norm(text_vec) * np.linalg.norm(vec_np) + 1e-8)
+
+                # Class-prior boosting based on query keywords and object type
+                payload = p.payload if hasattr(p, "payload") else {}
+                obj_type_l = str(payload.get("object_type", "")).lower()
+                obj_color = str(payload.get("object_color", "")).lower() if payload.get("object_color") else None
+                
+                is_phone = ("phone" in obj_type_l) or ("cell" in obj_type_l)
+                is_laptop = ("laptop" in obj_type_l) or ("computer" in obj_type_l)
+                is_bag = any(k in obj_type_l for k in ["bag", "backpack", "handbag"]) and not is_laptop and not is_phone
+                is_suitcase = "suitcase" in obj_type_l or "luggage" in obj_type_l
+
+                boost = 0.0
+                
+                # Class type boosting
+                if q_is_phone:
+                    if is_phone:
+                        boost += 0.08
+                    elif is_bag or is_suitcase:
+                        boost -= 0.03
+                if q_is_laptop:
+                    if is_laptop:
+                        boost += 0.08
+                    elif is_bag or is_suitcase or is_phone:
+                        boost -= 0.02
+                if q_is_bag:
+                    if is_bag:
+                        boost += 0.08
+                    elif is_suitcase:
+                        boost += 0.03
+                    elif is_phone or is_laptop:
+                        boost -= 0.02
+                if q_is_suitcase:
+                    if is_suitcase:
+                        boost += 0.08
+                    elif is_bag:
+                        boost += 0.03
+                    elif is_phone or is_laptop:
+                        boost -= 0.02
+                
+                # Color boosting (strong signal if color matches)
+                if q_color and obj_color:
+                    if q_color == obj_color:
+                        boost += 0.12  # Strong boost for color match
+                    else:
+                        boost -= 0.05  # Penalty for wrong color
+
+                similarities.append((sim + boost, p))
+            
+            if not similarities:
+                print("   ⚠ No matching objects found")
+                return []
+            
+            # Sort by similarity
+            similarities.sort(key=lambda x: x[0], reverse=True)
+            top_results = similarities[:top_k]
+            
+            print(f"\n{'='*80}")
+            print(f"📦 TOP {len(top_results)} OBJECT RESULTS FOR: '{text_prompt}' (CLIP Semantic)")
+            print(f"{'='*80}")
+            
+            results = []
+            for idx, (score, p) in enumerate(top_results, 1):
+                payload = p.payload if hasattr(p, "payload") else {}
+                
+                track_id = payload.get("track_id", "Unknown")
+                object_type = payload.get("object_type", "Unknown")
+                object_color = payload.get("object_color", None)
+                video_id = payload.get("video_id", "Unknown")
+                start_time = payload.get("start_time", "Unknown")
+                end_time = payload.get("end_time", "Unknown")
+                num_frames = payload.get("num_frames", 0)
+                avg_confidence = payload.get("avg_confidence", 0.0)
+                
+                # Display with color if available
+                color_str = f" ({object_color})" if object_color else ""
+                print(f"\n{idx}. Track ID: {track_id} | Object: {object_type}{color_str} | Similarity: {score:.3f}")
+                print(f"   Video ID: {video_id} | Time: {start_time}s - {end_time}s | Frames: {num_frames}")
+                print(f"   Confidence: {avg_confidence:.2f}")
+                
+                # Return format consistent with interactive loop: (track_id, score, payload)
+                results.append((track_id, score, payload))
+            
+            return results
+        
+        else:
+            # Fallback: Keyword matching (no CLIP embeddings available)
+            print(f"   📝 Using keyword matching (no CLIP embeddings)")
+            
+            # Scroll all object tracks
+            points, _ = client.scroll(
+                collection_name="object_tracks",
+                limit=1000,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+            if not points:
+                print("   ⚠ No objects found in collection")
+                return []
+
+            matches = []
+            query_lower = text_prompt.lower()
+            
+            for p in points:
+                payload = p.payload if hasattr(p, "payload") else {}
+                object_type = payload.get("object_type", "").lower()
+                
+                # Simple keyword matching for objects
+                score = 0.0
+                
+                # Direct object type matching
+                if any(keyword in query_lower for keyword in ["laptop", "computer"]):
+                    if "laptop" in object_type:
+                        score = 1.0
+                elif any(keyword in query_lower for keyword in ["phone", "mobile", "cell"]):
+                    if "phone" in object_type or "cell" in object_type:
+                        score = 1.0
+                elif any(keyword in query_lower for keyword in ["backpack", "bag"]):
+                    if "backpack" in object_type or "bag" in object_type:
+                        score = 1.0
+                elif any(keyword in query_lower for keyword in ["suitcase", "luggage"]):
+                    if "suitcase" in object_type:
+                        score = 1.0
+                # Fallback: partial match
+                else:
+                    for keyword in query_lower.split():
+                        if len(keyword) > 3 and keyword in object_type:
+                            score = 0.8
+                            break
+                
+                if score > 0:
+                    matches.append((score, p))
+            
+            if not matches:
+                print("   ⚠ No matching objects found")
+                return []
+            
+            matches.sort(key=lambda x: x[0], reverse=True)
+            top_results = matches[:top_k]
+
+            print(f"\n{'='*80}")
+            print(f"📦 TOP {len(top_results)} OBJECT RESULTS FOR: '{text_prompt}' (Keyword)")
+            print(f"{'='*80}")
+
+            results = []
+            for idx, (score, p) in enumerate(top_results, 1):
+                payload = p.payload if hasattr(p, "payload") else {}
+                
+                track_id = payload.get("track_id", "Unknown")
+                object_type = payload.get("object_type", "Unknown")
+                video_id = payload.get("video_id", "Unknown")
+                start_time = payload.get("start_time", "Unknown")
+                end_time = payload.get("end_time", "Unknown")
+                num_frames = payload.get("num_frames", 0)
+                avg_confidence = payload.get("avg_confidence", 0.0)
+                
+                results.append((track_id, score, payload))
+                
+                print(f"\n📦 Result #{idx}")
+                print(f"   Object Type: {object_type}")
+                print(f"   Track ID: {track_id}")
+                print(f"   Match Score: {score:.2%}")
+                print(f"   Video ID: {video_id}")
+                print(f"   Time Range: {start_time} → {end_time}")
+                print(f"   Duration: {num_frames} frames")
+                print(f"   Avg Confidence: {avg_confidence:.3f}")
+            
+            print(f"\n{'='*80}\n")
+            return results
+        
+    except Exception as e:
+        print(f"❌ Error during object query: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
 def query_tracklets_by_text(text_prompt, top_k=5):
     """
     Query Qdrant for tracklets matching a text description using CLIP embeddings.
@@ -2978,12 +3336,16 @@ def query_tracklets_by_text(text_prompt, top_k=5):
 print("\n" + "🎤"*40)
 print("\n📝 INTERACTIVE QUERY MODE")
 print("=" * 80)
-print("Enter text prompts to search for tracklets in the video.")
+print("Enter text prompts to search for people or objects in the video.")
 print("Examples:")
-print("  - 'person holding a mobile phone'")
-print("  - 'person carrying a backpack'")
-print("  - 'person with a laptop'")
-print("  - 'person holding an object'")
+print("  PERSON QUERIES:")
+print("    - 'person holding a mobile phone'")
+print("    - 'person wearing a red shirt'")
+print("    - 'person with glasses'")
+print("  OBJECT QUERIES:")
+print("    - 'laptop'")
+print("    - 'find me a phone'")
+print("    - 'backpack'")
 print("Type 'quit' or 'exit' to end.\n")
 print("=" * 80 + "\n")
 
@@ -3000,18 +3362,41 @@ while True:
             print("⚠ Empty prompt. Please try again.\n")
             continue
         
-        # Query Qdrant
-        matches = query_tracklets_by_text(user_prompt, top_k=5)
+        # Smart routing: detect if query is for objects only or persons
+        query_lower = user_prompt.lower()
+        is_object_only = (
+            # Query is object-only if it mentions object names without "person"
+            ("person" not in query_lower and "people" not in query_lower) and
+            any(obj_keyword in query_lower for obj_keyword in [
+                "laptop", "computer", "phone", "mobile", "cell",
+                "backpack", "bag", "handbag", "suitcase", "luggage"
+            ])
+        )
+        
+        # Route to appropriate query function
+        if is_object_only:
+            print("   → Detected OBJECT query, searching object_tracks...")
+            matches = query_objects_by_text(user_prompt, top_k=5)
+        else:
+            print("   → Detected PERSON query, searching person_tracks...")
+            matches = query_tracklets_by_text(user_prompt, top_k=5)
         
         if matches:
             print("💡 KEY FINDINGS:")
-            for track_id, score, payload in matches:
-                carried = payload.get('object_carried', [])
-                print(f"   • Track ID: {track_id} (Confidence: {score:.2%})", end="")
-                if carried:
-                    print(f" - Carrying: {', '.join(carried)}")
-                else:
-                    print()
+            if is_object_only:
+                # Object results
+                for track_id, score, payload in matches:
+                    object_type = payload.get('object_type', 'Unknown')
+                    print(f"   • {object_type} (Track ID: {track_id}, Match: {score:.2%})")
+            else:
+                # Person results
+                for track_id, score, payload in matches:
+                    carried = payload.get('object_carried', [])
+                    print(f"   • Person Track ID: {track_id} (Confidence: {score:.2%})", end="")
+                    if carried:
+                        print(f" - Carrying: {', '.join(carried)}")
+                    else:
+                        print()
         
         print()
         
