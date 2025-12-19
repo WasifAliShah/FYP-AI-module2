@@ -1461,9 +1461,10 @@ while True:
     # PERSON DETECTION (every 13 frames)
     # ============================================
     if is_person_detection_frame:
-        # person detection - use lower confidence for ByteTrack (it handles low-confidence detections well)
+        # person detection - use larger imgsz for close-ups and lower confidence
+        # imgsz=1280 handles both distant and close-up persons better
         # ByteTrack's strength is using low-confidence detections for better association
-        p_results = yolo_person.predict(frame, imgsz=640, conf=0.3, classes=[0], verbose=False)
+        p_results = yolo_person.predict(frame, imgsz=1280, conf=0.25, classes=[0], verbose=False)
         person_boxes = []
         person_detections = []  # For ByteTrack: [x1, y1, x2, y2, score]
         
@@ -1472,6 +1473,10 @@ while True:
             all_scores = []
             all_detections = []
             
+            # Debug: count how many detections before filtering
+            raw_detection_count = len(p_results[0].boxes)
+            filtered_counts = {"invalid": 0, "too_small": 0, "aspect_ratio": 0, "kept": 0}
+            
             for b in p_results[0].boxes:
                 x1,y1,x2,y2 = b.xyxy[0].cpu().numpy().astype(int)
                 conf = float(b.conf[0].cpu().numpy())
@@ -1479,6 +1484,7 @@ while True:
                 
                 # Skip invalid boxes
                 if x2 <= x1 or y2 <= y1:
+                    filtered_counts["invalid"] += 1
                     continue
                 
                 # Filter out small/partial detections (likely hands, arms, etc.)
@@ -1487,25 +1493,37 @@ while True:
                 box_area = box_width * box_height
                 frame_area = w * h
                 
-                # Skip very small boxes (likely body parts, not full persons)
-                # Minimum size: at least 2% of frame area, or minimum 100x150 pixels
-                min_area = max(frame_area * 0.02, 100 * 150)
+                # Skip very small boxes (likely body parts, not full persons)  
+                # Minimum size: at least 1.5% of frame area, or minimum 80x120 pixels
+                # Relaxed from 2% to handle more cases
+                min_area = max(frame_area * 0.015, 80 * 120)
                 if box_area < min_area:
+                    filtered_counts["too_small"] += 1
                     continue
                 
-                # Skip boxes that are too wide relative to height (likely not a person)
-                # Person boxes should be roughly 1:2 to 1:3 width:height ratio
+                # Skip boxes with extreme aspect ratios
+                # Relaxed aspect ratio checks for close-ups (close-up faces/upper body can be wider)
                 aspect_ratio = box_width / max(box_height, 1)
-                if aspect_ratio > 0.8:  # Too wide (likely not a person)
+                if aspect_ratio > 1.2:  # Too wide (relaxed from 0.8 for close-ups)
+                    filtered_counts["aspect_ratio"] += 1
                     continue
                 
                 # Skip boxes that are too tall and narrow (likely not a person)
                 if aspect_ratio < 0.2:  # Too narrow
+                    filtered_counts["aspect_ratio"] += 1
                     continue
                 
+                filtered_counts["kept"] += 1
                 all_boxes.append([x1, y1, x2, y2])
                 all_scores.append(conf)
                 all_detections.append((x1,y1,x2,y2))
+            
+            # Debug output for first few frames or when no detections kept
+            if frame_idx <= DETECT_EVERY_N_FRAMES * 3 or filtered_counts["kept"] == 0:
+                print(f"[Person Detection Debug] Frame {frame_idx}: "
+                      f"Raw detections: {raw_detection_count}, "
+                      f"Filtered: {filtered_counts}, "
+                      f"Frame size: {w}x{h}")
             
             # Apply NMS to filter overlapping detections (same person detected multiple times)
             # Use moderate IoU threshold (0.45) - ByteTrack can handle some overlapping detections
