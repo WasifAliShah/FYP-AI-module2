@@ -1,0 +1,31 @@
+# Temporal Python Worker - Requirements
+# Install with: pip install -r requirements.txt
+
+# Temporal SDK for Python
+temporalio>=1.5.0
+
+# AWS/S3 for Backblaze B2
+boto3>=1.34.0
+botocore>=1.34.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Qdrant vector database client
+qdrant-client>=1.7.0
+
+# Video processing (existing dependencies - for reference)
+# These should already be in your main requirements.txt for the pipeline
+# opencv-python>=4.8.0
+# numpy>=1.24.0
+# torch>=2.0.0
+# torchvision>=0.15.0
+# ultralytics>=8.0.0
+# insightface>=0.7.0
+# pillow>=10.0.0
+
+# Optional: For production deployments
+# gunicorn>=21.0.0  # For running multiple workers
