@@ -49,71 +49,94 @@ def create_qdrant_schema(client: QdrantClient):
     """
     print("Starting Qdrant collection setup and indexing...")
     
-    # --- 3. Collection Creation ---
+    # --- 3. Collection Creation (PRESERVE EXISTING DATA) ---
 
-    # A. Create or Recreate person_tracks
+    # A. Create person_tracks collection if it doesn't exist
     try:
-        client.recreate_collection(
-            collection_name=PERSON_TRACKS_COLLECTION,
-            vectors_config=PERSON_TRACKS_VECTORS
-        )
-        print(f"✅ Collection '{PERSON_TRACKS_COLLECTION}' created with vectors: face_vec (512D), reid_vec (512D), multi_vec (768D)")
+        existing_collections = client.get_collections()
+        collection_names = [col.name for col in existing_collections.collections]
+
+        if PERSON_TRACKS_COLLECTION not in collection_names:
+            client.create_collection(
+                collection_name=PERSON_TRACKS_COLLECTION,
+                vectors_config=PERSON_TRACKS_VECTORS
+            )
+            print(f"✅ Collection '{PERSON_TRACKS_COLLECTION}' created with vectors: face_vec (512D), reid_vec (512D), multi_vec (768D)")
+        else:
+            print(f"ℹ️ Collection '{PERSON_TRACKS_COLLECTION}' already exists - preserving existing data")
     except Exception as e:
-        print(f"⚠ Error creating person_tracks collection: {e}")
+        print(f"⚠ Error creating/checking person_tracks collection: {e}")
         return False
 
-    # B. Create or Recreate object_tracks
+    # B. Create object_tracks collection if it doesn't exist
     try:
-        client.recreate_collection(
-            collection_name=OBJECT_TRACKS_COLLECTION,
-            vectors_config=OBJECT_TRACKS_VECTORS
-        )
-        print(f"✅ Collection '{OBJECT_TRACKS_COLLECTION}' created with vectors: object_vec (768D), multi_vec (768D)")
+        existing_collections = client.get_collections()
+        collection_names = [col.name for col in existing_collections.collections]
+
+        if OBJECT_TRACKS_COLLECTION not in collection_names:
+            client.create_collection(
+                collection_name=OBJECT_TRACKS_COLLECTION,
+                vectors_config=OBJECT_TRACKS_VECTORS
+            )
+            print(f"✅ Collection '{OBJECT_TRACKS_COLLECTION}' created with vectors: object_vec (768D), multi_vec (768D)")
+        else:
+            print(f"ℹ️ Collection '{OBJECT_TRACKS_COLLECTION}' already exists - preserving existing data")
     except Exception as e:
-        print(f"⚠ Error creating object_tracks collection: {e}")
+        print(f"⚠ Error creating/checking object_tracks collection: {e}")
         return False
 
     # --- 4. Payload Indexing (CRITICAL for Hybrid Search Performance) ---
 
     try:
         # Indexes for person_tracks
-        print(f"\nIndexing person_tracks payload fields...")
+        print(f"\nSetting up person_tracks indexes...")
         
         # INTEGER indexes
-        client.create_payload_index(PERSON_TRACKS_COLLECTION, "video_id", models.PayloadSchemaType.INTEGER)
-        client.create_payload_index(PERSON_TRACKS_COLLECTION, "segment_id", models.PayloadSchemaType.INTEGER)
-        client.create_payload_index(PERSON_TRACKS_COLLECTION, "track_id", models.PayloadSchemaType.INTEGER)
+        person_index_fields = [
+            ("video_id", models.PayloadSchemaType.INTEGER),
+            ("segment_id", models.PayloadSchemaType.INTEGER),
+            ("track_id", models.PayloadSchemaType.INTEGER),
+            ("person_gender", models.PayloadSchemaType.KEYWORD),
+            ("upper_color", models.PayloadSchemaType.KEYWORD),
+            ("lower_color", models.PayloadSchemaType.KEYWORD),
+            ("object_carried", models.PayloadSchemaType.KEYWORD),
+            ("avg_confidence", models.PayloadSchemaType.FLOAT)
+        ]
         
-        # KEYWORD indexes (for filtering)
-        client.create_payload_index(PERSON_TRACKS_COLLECTION, "person_gender", models.PayloadSchemaType.KEYWORD)
-        client.create_payload_index(PERSON_TRACKS_COLLECTION, "upper_color", models.PayloadSchemaType.KEYWORD)
-        client.create_payload_index(PERSON_TRACKS_COLLECTION, "lower_color", models.PayloadSchemaType.KEYWORD)
-        client.create_payload_index(PERSON_TRACKS_COLLECTION, "object_carried", models.PayloadSchemaType.KEYWORD)
+        for field, index_type in person_index_fields:
+            try:
+                client.create_payload_index(PERSON_TRACKS_COLLECTION, field, index_type)
+            except Exception as e:
+                # Index likely already exists - continue silently
+                pass
         
-        # FLOAT index
-        client.create_payload_index(PERSON_TRACKS_COLLECTION, "avg_confidence", models.PayloadSchemaType.FLOAT)
-        
-        print(f"✅ Indexes created for {PERSON_TRACKS_COLLECTION}")
+        print(f"✓ Person tracks indexes ready")
     except Exception as e:
-        print(f"⚠ Error creating indexes for person_tracks: {e}")
+        print(f"⚠ Error setting up person_tracks indexes: {e}")
 
     try:
         # Indexes for object_tracks
-        print(f"\nIndexing object_tracks payload fields...")
+        print(f"Setting up object_tracks indexes...")
         
-        # INTEGER indexes
-        client.create_payload_index(OBJECT_TRACKS_COLLECTION, "video_id", models.PayloadSchemaType.INTEGER)
-        client.create_payload_index(OBJECT_TRACKS_COLLECTION, "segment_id", models.PayloadSchemaType.INTEGER)
-        client.create_payload_index(OBJECT_TRACKS_COLLECTION, "object_id", models.PayloadSchemaType.INTEGER)
-        client.create_payload_index(OBJECT_TRACKS_COLLECTION, "associated_person_track", models.PayloadSchemaType.INTEGER)
+        object_index_fields = [
+            ("video_id", models.PayloadSchemaType.INTEGER),
+            ("segment_id", models.PayloadSchemaType.INTEGER),
+            ("object_id", models.PayloadSchemaType.INTEGER),
+            ("associated_person_track", models.PayloadSchemaType.INTEGER),
+            ("category", models.PayloadSchemaType.KEYWORD),
+            ("object_color", models.PayloadSchemaType.KEYWORD)
+        ]
         
-        # KEYWORD indexes
-        client.create_payload_index(OBJECT_TRACKS_COLLECTION, "category", models.PayloadSchemaType.KEYWORD)
-        client.create_payload_index(OBJECT_TRACKS_COLLECTION, "object_color", models.PayloadSchemaType.KEYWORD)
+        for field, index_type in object_index_fields:
+            try:
+                client.create_payload_index(OBJECT_TRACKS_COLLECTION, field, index_type)
+            except Exception as e:
+                # Index likely already exists - continue silently
+                pass
         
-        print(f"✅ Indexes created for {OBJECT_TRACKS_COLLECTION}")
+        print(f"✓ Object tracks indexes ready")
     except Exception as e:
-        print(f"⚠ Error creating indexes for object_tracks: {e}")
+        print(f"⚠ Error setting up object_tracks indexes: {e}")
     
     print("\n" + "="*60)
     print("✅ Qdrant schema setup and indexing complete!")

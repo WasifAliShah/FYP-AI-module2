@@ -30,6 +30,9 @@ qdrant-client>=1.7.0
 boto3>=1.42.1
 python-dotenv>=1.2.1
 
+# OpenAI CLIP for text-image embeddings
+git+https://github.com/openai/CLIP.git
+
 # Optional: Real-ESRGAN for super-resolution
 # Uncomment if you want to use Real-ESRGAN
 # realesrgan>=0.3.0

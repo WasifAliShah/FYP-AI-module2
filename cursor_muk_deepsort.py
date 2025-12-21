@@ -7,11 +7,13 @@ from collections import deque
 import numpy as np
 import cv2
 import torch
+import warnings
+warnings.filterwarnings('ignore')
 import torchvision.transforms as T
 from torchvision.models import resnet50
 from ultralytics import YOLO
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, NamedVector
+from qdrant_client.models import Distance, VectorParams, NamedVector, PointStruct
 from dotenv import load_dotenv
 import os
 import qdrant_collections  # for collection constants
@@ -609,6 +611,40 @@ def detect_person_attributes(crop, face_crop=None):
         # If detection fails, return neutral attributes (all False)
         return attributes
 
+def extract_face_embedding_optimized(crop_person, face_boxes_frame, person_box):
+    """
+    Extract face embedding from person crop using InsightFace.
+    
+    Args:
+        crop_person: Person crop image (BGR)
+        face_boxes_frame: List of face boxes detected in the frame
+        person_box: Person bounding box [x1, y1, x2, y2]
+    
+    Returns:
+        tuple: (face_embedding, face_size) where face_size is the width of the detected face
+    """
+    if not fa or not INSIGHTFACE_AVAILABLE:
+        return None, 0
+    
+    try:
+        # Use InsightFace to detect faces in the person crop
+        faces = fa.get(crop_person)
+        
+        if faces and len(faces) > 0:
+            # Use the first (best) face detected
+            face = faces[0]
+            face_emb = normalize(np.array(face.embedding))
+            # Face size is the width of the bounding box
+            face_size = int(face.bbox[2] - face.bbox[0])
+            return face_emb, face_size
+        else:
+            # No face detected
+            return None, 0
+            
+    except Exception as e:
+        print(f"⚠ Face embedding extraction failed: {e}")
+        return None, 0
+
 # ----------------------
 # Build reference embeddings
 # ----------------------
@@ -632,7 +668,7 @@ for path in REF_FACE_PATHS:
         if faces and len(faces) > 0:
             face_emb = normalize(np.array(faces[0].embedding))
             ref_face_embs.append(face_emb)
-            print(f"✓ Loaded reference face embedding from {path} (face detected, embedding size: {len(face_emb)})")
+            print(f"✓ Reference face loaded: {len(face_emb)}D")
         else:
             print(f"⚠ Warning: No face detected in reference image {path} - face recognition will not work!")
     else:
@@ -642,33 +678,23 @@ for path in REF_FACE_PATHS:
     reid_emb = reid_encode(img)
     if reid_emb is not None:
         ref_reid_embs.append(reid_emb)
-        print(f"✓ Loaded reference ReID embedding from {path} (embedding size: {len(reid_emb)})")
+        print(f"✓ Reference ReID loaded: {len(reid_emb)}D")
 
-print(f"\n=== Reference Embeddings Summary ===")
-print(f"Face embeddings: {len(ref_face_embs)}")
-print(f"ReID embeddings: {len(ref_reid_embs)}")
-if len(ref_face_embs) == 0:
-    print("⚠ CRITICAL: No face embeddings loaded! Face recognition will be disabled.")
-    
-# Determine if reference is face-only (face-only images are not suitable for ReID)
+# Determine if reference is face-only (affects verification strategy)
+USE_REID_FOR_ALL_TRACKS = True  # Enable ReID collection for all tracks regardless of verification status
 USE_REID_VERIFICATION = len(ref_face_embs) > 0 and len(ref_reid_embs) > 0
-# If we have face embeddings but reference might be face-only, disable ReID verification
-# ReID is unreliable when reference is face-only (not full body)
+# If we have face embeddings, enable strict face-based verification
 if len(ref_face_embs) > 0:
-    print("⚠ IMPORTANT: Reference contains face images. ReID verification DISABLED (unreliable for face-only references).")
-    print("   Only face recognition will be used for verification.")
-    USE_REID_VERIFICATION = False
+    print("⚠ IMPORTANT: Reference contains face images. STRICT face verification enabled.")
+    print("   Only face matches = VERIFIED. ReID collected for all tracks but doesn't affect verification.")
+    USE_REID_VERIFICATION = True
 print("=" * 40 + "\n")
 
 # ===== DEBUG: Identify embedding dimensions =====
 FACE_EMBEDDING_DIM = len(ref_face_embs[0]) if len(ref_face_embs) > 0 else None
 REID_EMBEDDING_DIM = len(ref_reid_embs[0]) if len(ref_reid_embs) > 0 else None
 
-print("=" * 40)
-print("🔍 EMBEDDING DIMENSIONS DETECTED:")
-print(f"  Face embedding (InsightFace): {FACE_EMBEDDING_DIM}D")
-print(f"  ReID embedding (TorchReID OSNet): {REID_EMBEDDING_DIM}D")
-print("=" * 40 + "\n")
+print(f"✓ Embeddings: Face {FACE_EMBEDDING_DIM}D, ReID {REID_EMBEDDING_DIM}D")
 
 # ----------------------
 # Helper functions
@@ -1032,60 +1058,20 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
             "multi_vec": multi_vec,        # 768D (CLIP or padded face_vec)
         }
         
-        # DEBUG: Print what's being sent to Qdrant
-        print("\n" + "="*80)
-        print(f"🔍 DEBUG: Inserting Tracklet {tracklet.id} to Qdrant ({'VERIFIED' if tracklet.verified else 'UNVERIFIED'})")
-        print("="*80)
-        print(f"Point ID: {point_id}")
-        print(f"\n📦 PAYLOAD:")
-        print(f"  video_id: {payload['video_id']}")
-        print(f"  track_id: {payload['track_id']}")
-        print(f"  start_time: {payload['start_time']}")
-        print(f"  end_time: {payload['end_time']}")
-        print(f"  num_frames: {payload['num_frames']}")
-        print(f"  avg_confidence: {payload['avg_confidence']}")
-        print(f"  timestamp: {payload['timestamp']}")
-        print(f"  person_gender: {payload['person_gender']}")
-        print(f"  upper_color: {payload['upper_color']}")
-        print(f"  lower_color: {payload['lower_color']}")
-        print(f"  object_carried: {payload['object_carried']}")
-        print(f"  verified: {payload['verified']}")
-        if 'segment_id' in payload:
-            print(f"  segment_id: {payload['segment_id']}")
-        
-        print(f"\n🔢 VECTORS:")
-        face_status = "InsightFace" if len(tracklet.face_embs) > 0 else "Zero (no face detected)"
-        reid_status = "TorchReID/ResNet50" if len(tracklet.reid_embs) > 0 else "Zero (no ReID)"
-        print(f"  face_vec: {len(face_vec)}D ({face_status})")
-        print(f"    Sample: [{face_vec[0]:.6f}, {face_vec[1]:.6f}, {face_vec[2]:.6f}, ...]")
-        print(f"  reid_vec: {len(reid_vec)}D ({reid_status})")
-        print(f"    Sample: [{reid_vec[0]:.6f}, {reid_vec[1]:.6f}, {reid_vec[2]:.6f}, ...]")
-        print(f"  multi_vec: {len(multi_vec)}D ({'CLIP' if clip_avg is not None else 'Face (padded)'})")
-        print(f"    Sample: [{multi_vec[0]:.6f}, {multi_vec[1]:.6f}, {multi_vec[2]:.6f}, ...]")
-        
-        print(f"\n📊 TRACKLET STATS:")
-        print(f"  Verified: {tracklet.verified}")
-        print(f"  Face embeddings collected: {len(tracklet.face_embs)}")
-        print(f"  ReID embeddings collected: {len(tracklet.reid_embs)}")
-        print(f"  CLIP embeddings collected: {len(tracklet.clip_embs)}")
-        print(f"  Carried objects observed: {len(tracklet.carried_objects)}")
-        print("="*80 + "\n")
-        
-        # Insert into Qdrant
-        from qdrant_client.models import PointStruct
+        # Insert to Qdrant (quiet success)
         point = PointStruct(
             id=point_id,
             vector=vectors,  # NamedVectors
             payload=payload
         )
-        
         client.upsert(
             collection_name="person_tracks",
             points=[point]
         )
         
+        # Simple success message
         status = "VERIFIED" if tracklet.verified else "UNVERIFIED"
-        print(f"✅ Inserted {status} tracklet {tracklet.id} to Qdrant (ID: {point_id})")
+        print(f"✓ Inserted {status} tracklet {tracklet.id} to Qdrant")
         return True
         
     except Exception as e:
@@ -1169,19 +1155,19 @@ def insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None
         }
         
         # Insert into Qdrant
-        from qdrant_client.models import PointStruct
         point = PointStruct(
             id=point_id,
             vector=vectors,
             payload=payload
         )
         
+        # Quiet success
         client.upsert(
             collection_name="object_tracks",
             points=[point]
         )
         
-        print(f"✅ Inserted object track {obj_track.id} ({obj_track.class_name}) to Qdrant (ID: {point_id}, frames: {num_frames}, conf: {payload['avg_confidence']:.3f})")
+        print(f"✓ Inserted object {obj_track.id} ({obj_track.class_name}) to Qdrant")
         return True
         
     except Exception as e:
@@ -1445,6 +1431,9 @@ next_tid = 1
 next_obj_id = 1
 OBJ_TRACK_MAX_AGE = 30  # Keep object tracks for 30 frames after last detection
 OBJ_IOU_THRESHOLD = 0.3  # IoU threshold for matching object detections
+
+# Debug: Show Qdrant client status
+print(f"🔍 Qdrant client status: {'Connected' if client else 'Not connected (None)'}")
 
 # small helper to map face boxes per frame
 face_boxes_frame = []
@@ -1866,7 +1855,7 @@ while True:
                             obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None, frame_rate=30.0)
                         del object_tracklets[oid]
                     
-                    if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                    if frame_idx <= 50:  # Only first 50 frames
                         obj_names = [obj[0] for obj in current_detections] if current_detections else []
                         matched_count = sum(1 for tid in object_tracklets.keys() if object_tracklets[tid].last_frame == frame_idx)
                         print(f"[Object Tracking] Frame {frame_idx}: Detected {len(current_detections)} objects: {obj_names}, ByteTrack tracks: {len(tracked_obj_tracks)}, Active object_tracklets: {len(object_tracklets)}, New/Updated this frame: {matched_count}")
@@ -2006,8 +1995,8 @@ while True:
             elif any('bag' in name.lower() or 'pack' in name.lower() for name in all_detected.keys()):
                 bag_related = [(name, conf) for name, conf in all_detected.items() if 'bag' in name.lower() or 'pack' in name.lower()]
                 print(f"[Debug] Bag-related objects detected: {bag_related}")
-            # Show all detected objects for debugging
-            if frame_idx <= DETECT_EVERY_N_FRAMES * 2:
+            # Show all detected objects for debugging (reduced frequency)
+            if frame_idx <= 30:  # Only first 30 frames
                 print(f"[Debug] All objects detected (conf >= 0.15): {list(all_detected.keys())}")
 
     # ============================================
@@ -2079,211 +2068,9 @@ while True:
                     # Update existing tracklet with accurate bbox (person detection preferred)
                     tracklets[current_tid].bboxes.append(vis_bbox)
                     tracklets[current_tid].last_frame = frame_idx
-                
-                # ---- Face detection: Try multiple methods for best results
-                face_emb = None
-                face_size = 0
-                carried_objs = []
 
-                # Method 1: Try YOLO face boxes first (if available)
-                matched_face = None
-                for fb in face_boxes_frame:
-                    if box_inside(fb, box) or iou(fb, box) > 0.1:
-                        matched_face = fb
-                        break
-
-                if matched_face is not None:
-                    fx1,fy1,fx2,fy2 = matched_face
-                    # ensure clamp
-                    fx1,fy1,fx2,fy2 = max(0,fx1),max(0,fy1),min(w,fx2),min(h,fy2)
-                    face_crop = frame[fy1:fy2, fx1:fx2].copy()
-                    face_size = (fx2-fx1)
-
-                    # For faces < 60px, ALWAYS upscale before getting embedding for better quality
-                    # This improves recognition accuracy for distant faces
-                    if face_size < 60:
-                        # Use larger upscale factor for very small faces
-                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 45 else 2)
-                        face_crop_up = sr_enhance(face_crop, factor=upscale_factor)
-                        
-                        # Try InsightFace on upscaled crop first (better quality)
-                        if fa:
-                            try:
-                                faces_up = fa.get(face_crop_up)
-                                if faces_up and len(faces_up) > 0:
-                                    # Debug: check what attributes are available
-                                    if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                        print(f"  → InsightFace found {len(faces_up)} face(s) in upscaled crop, has embedding: {hasattr(faces_up[0], 'embedding')}")
-                                    if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                        face_emb = normalize(np.array(faces_up[0].embedding))
-                                        if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                            print(f"  → ✓ Got embedding from upscaled face crop!")
-                                    # Update face_size from upscaled detection
-                                    if hasattr(faces_up[0], 'bbox'):
-                                        detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                        if detected_w > 0:
-                                            face_size = detected_w
-                            except Exception as e:
-                                if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                    print(f"  → Error getting embedding from upscaled crop: {e}")
-                                pass
-                    else:
-                        # For larger faces (>= 60px), try InsightFace on original crop
-                        if fa:
-                            try:
-                                faces = fa.get(face_crop)
-                                if faces and len(faces) > 0:
-                                    # Try to get embedding directly
-                                    if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
-                                        face_emb = normalize(np.array(faces[0].embedding))
-                                    # Update face_size from InsightFace detection if available
-                                    if hasattr(faces[0], 'bbox'):
-                                        detected_w = int(faces[0].bbox[2] - faces[0].bbox[0])
-                                        if detected_w > 0:
-                                            face_size = detected_w
-                            except Exception as e:
-                                pass
-                    
-                    # Fallback: if upscaling didn't work for small faces, try original
-                    if face_emb is None and face_size < 60:
-                        if fa:
-                            try:
-                                faces = fa.get(face_crop)
-                                if faces and len(faces) > 0:
-                                    if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
-                                        face_emb = normalize(np.array(faces[0].embedding))
-                            except Exception as e:
-                                pass
-                    
-                    # Final fallback: if still no embedding and face is small, try upscaling
-                    if face_emb is None and face_size < 80:
-                        # Use larger upscale factor for very small faces
-                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
-                        face_crop_up = sr_enhance(face_crop, factor=upscale_factor)
-                        
-                        # Try InsightFace on upscaled crop
-                        if fa:
-                            try:
-                                faces_up = fa.get(face_crop_up)
-                                if faces_up and len(faces_up) > 0:
-                                    if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                        face_emb = normalize(np.array(faces_up[0].embedding))
-                                    # Update face_size from upscaled detection
-                                    if hasattr(faces_up[0], 'bbox'):
-                                        detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                        if detected_w > 0:
-                                            face_size = detected_w
-                            except Exception as e:
-                                pass
-
-                # Method 2: ALWAYS try InsightFace on person crop (most reliable, works even if YOLO misses faces)
-                # This is critical because InsightFace is better at detecting faces in person crops
-                if face_emb is None and fa:
-                    try:
-                        # First try on person crop directly - this should work!
-                        # InsightFace is very good at detecting faces in person crops
-                        faces = fa.get(crop_person)
-                        if faces and len(faces) > 0:
-                            f = faces[0]
-                            # Debug output
-                            if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                print(f"  → InsightFace found {len(faces)} face(s) in person crop, has embedding: {hasattr(f, 'embedding')}")
-                            
-                            # face bbox is relative to crop_person: compute absolute width
-                            if hasattr(f, 'bbox') and f.bbox is not None:
-                                fw = int(f.bbox[2] - f.bbox[0])
-                                face_size = max(face_size, fw)  # Use larger of YOLO or InsightFace size
-                            
-                            # ALWAYS try to get embedding directly first (even for small faces)
-                            # InsightFace embeddings work well even on small faces
-                            if hasattr(f, 'embedding') and f.embedding is not None:
-                                face_emb = normalize(np.array(f.embedding))
-                                if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                    print(f"  → ✓ Got embedding directly from person crop!")
-                            
-                            # For faces < 60px, ALSO try upscaling for potentially better quality
-                            # This improves recognition accuracy for distant faces
-                            if face_size < 60:
-                            # Extract face region and upscale it for better embedding quality
-                                if hasattr(f, 'bbox') and f.bbox is not None:
-                                    bx1 = max(0, int(f.bbox[0])); by1 = max(0, int(f.bbox[1]))
-                                    bx2 = min(crop_person.shape[1], int(f.bbox[2])); by2 = min(crop_person.shape[0], int(f.bbox[3]))
-                                    if bx2 > bx1 and by2 > by1:
-                                        face_region = crop_person[by1:by2, bx1:bx2].copy()
-                                        if face_region.size > 0:
-                                            # Use larger upscale factor for very small faces
-                                            upscale_factor = 4 if face_size < 30 else (3 if face_size < 45 else 2)
-                                            face_region_up = sr_enhance(face_region, factor=upscale_factor)
-                                            
-                                            # Get embedding from upscaled face (better quality)
-                                            faces_up = fa.get(face_region_up)
-                                            if faces_up and len(faces_up) > 0:
-                                                if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                                    # Use upscaled embedding if we don't have one, or if it's better quality
-                                                    emb_up = normalize(np.array(faces_up[0].embedding))
-                                                    if face_emb is None:
-                                                        face_emb = emb_up
-                                                        if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                                                            print(f"  → ✓ Got embedding from upscaled face region!")
-                                                # Update face_size from upscaled detection
-                                                if hasattr(faces_up[0], 'bbox'):
-                                                    detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                                    if detected_w > 0:
-                                                        face_size = detected_w
-                            
-                            # Fallback: if upscaling didn't work, try direct embedding
-                            if face_emb is None and face_size >= 60:
-                                if hasattr(f, 'embedding') and f.embedding is not None:
-                                    face_emb = normalize(np.array(f.embedding))
-                            
-                            # Final fallback: if still no embedding and face is small, try upscaling
-                            if face_emb is None and face_size < 80:
-                            # Extract face region and upscale it for better quality
-                                if hasattr(f, 'bbox') and f.bbox is not None:
-                                    bx1 = max(0, int(f.bbox[0])); by1 = max(0, int(f.bbox[1]))
-                                    bx2 = min(crop_person.shape[1], int(f.bbox[2])); by2 = min(crop_person.shape[0], int(f.bbox[3]))
-                                    if bx2 > bx1 and by2 > by1:
-                                        face_region = crop_person[by1:by2, bx1:bx2].copy()
-                                        if face_region.size > 0:
-                                            # Use larger upscale factor for very small faces
-                                            upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
-                                            face_region_up = sr_enhance(face_region, factor=upscale_factor)
-                                            
-                                            # Get embedding from upscaled face (better quality)
-                                            faces_up = fa.get(face_region_up)
-                                            if faces_up and len(faces_up) > 0:
-                                                if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                                    face_emb = normalize(np.array(faces_up[0].embedding))
-                                                # Update face_size from upscaled detection
-                                                if hasattr(faces_up[0], 'bbox'):
-                                                    detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                                    if detected_w > 0:
-                                                        face_size = detected_w
-                        else:
-                            # If InsightFace didn't find face in person crop, try on expanded region around person
-                            # Expand person bbox slightly and try again
-                            expand = 30  # Increased expansion
-                            x1_exp = max(0, x1 - expand)
-                            y1_exp = max(0, y1 - expand)
-                            x2_exp = min(w, x2 + expand)
-                            y2_exp = min(h, y2 + expand)
-                            expanded_crop = frame[y1_exp:y2_exp, x1_exp:x2_exp].copy()
-                            if expanded_crop.size > 0:
-                                faces_exp = fa.get(expanded_crop)
-                                if faces_exp and len(faces_exp) > 0:
-                                    f = faces_exp[0]
-                                    if hasattr(f, 'bbox') and f.bbox is not None:
-                                        fw = int(f.bbox[2] - f.bbox[0])
-                                        face_size = fw
-                                    if hasattr(f, 'embedding') and f.embedding is not None:
-                                        face_emb = normalize(np.array(f.embedding))
-                    except Exception as e:
-                        # Add debug info for failures
-                        if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
-                            print(f"  → InsightFace error on person crop: {e}")
-                        pass
-
-                # ---- ReID embedding (on person crop)
+                # ---- Optimized face and ReID extraction
+                face_emb, face_size = extract_face_embedding_optimized(crop_person, face_boxes_frame, vis_bbox)
                 reid_emb = reid_encode(crop_person)
                 
                 # ---- Carried objects association (EXTREMELY STRICT spatial checks)
@@ -2366,18 +2153,14 @@ while True:
                     # No objects detected - use person-only crop
                     clip_emb = clip_encode(crop_person)
                 
-                # Detect clothing colors from upper and lower parts of person crop
+                # Detect clothing colors (every frame for accuracy)
                 person_h, person_w = crop_person.shape[:2]
-                # Upper color: exclude face region to avoid skin tones
                 upper_part = mask_upper_by_face(crop_person, face_boxes_frame, vis_bbox)
-                lower_part = crop_person[person_h//2:, :]  # Bottom half
+                lower_part = crop_person[person_h//2:, :]
                 upper_color = get_dominant_color(upper_part)
                 lower_color = get_dominant_color(lower_part)
-                # Debug color extraction
-                if frame_idx % max(1, DETECT_EVERY_N_FRAMES * 2) == 0:
-                    print(f"   → Colors t{current_tid}: upper={upper_color}, lower={lower_color} (crop {person_w}x{person_h})")
                 
-                # Detect person attributes (hat, hood, glasses, backpack)
+                # Detect person attributes (every frame for accuracy)
                 detected_attributes = detect_person_attributes(crop_person, None)
 
                 # Update tracklet with face and ReID embeddings
@@ -2385,25 +2168,14 @@ while True:
                 t = tracklets[current_tid]
                 t.update(vis_bbox, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes)
                 
-                # Debug output for first few detections
-                if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
+                # Debug output (reduced frequency)
+                if frame_idx <= 100:  # Only first 100 frames
                     face_status = "✓" if face_emb is not None else "✗"
                     yolo_faces = len(face_boxes_frame)
                     person_h, person_w = crop_person.shape[:2]
-                    upscale_info = ""
-                    if face_size > 0 and face_size < 80:
-                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 50 else 2)
-                        upscale_info = f" (upscaled {upscale_factor}x for better quality)"
-                    print(f"[Frame {frame_idx}] Tracklet {current_tid}: "
-                          f"YOLO faces: {yolo_faces}, Face detected: {face_status} (size: {face_size}px){upscale_info}, "
-                          f"Person crop: {person_w}x{person_h}px, ReID: {'✓' if reid_emb is not None else '✗'}")
-                    if face_emb is None:
-                        if yolo_faces == 0:
-                            print(f"  → No YOLO faces found, trying InsightFace on person crop ({person_w}x{person_h}px)...")
-                        else:
-                            print(f"  → YOLO found {yolo_faces} face(s) but InsightFace failed to extract embedding!")
-                    if face_emb is not None:
-                        print(f"  → ✓ Face successfully detected and embedded! (size: {face_size}px)")
+                    print(f"[Frame {frame_idx}] Tracklet {current_tid}: YOLO faces: {yolo_faces}, Face detected: {face_status} (size: {face_size}px), Person crop: {person_w}x{person_h}px, ReID: {'✓' if reid_emb is not None else '✗'}")
+                    if face_emb is None and yolo_faces == 0:
+                        print(f"  → No YOLO faces found, tried InsightFace on person crop")
         
         # Process person boxes that weren't matched to ByteTrack tracks (fallback for missed detections)
         # This ensures all detected people are visualized, even if ByteTrack didn't track them
@@ -2452,43 +2224,11 @@ while True:
                     tracklets[current_tid] = Tracklet(current_tid, box, frame_idx)
                 
                 # Extract face and ReID for this unmatched person box
-                face_emb = None
-                face_size = 0
-                
-                # Try face detection
-                matched_face = None
-                for fb in face_boxes_frame:
-                    if box_inside(fb, box) or iou(fb, box) > 0.1:
-                        matched_face = fb
-                        break
-                
-                if matched_face is not None:
-                    fx1,fy1,fx2,fy2 = matched_face
-                    fx1,fy1,fx2,fy2 = max(0,fx1),max(0,fy1),min(w,fx2),min(h,fy2)
-                    face_crop = frame[fy1:fy2, fx1:fx2].copy()
-                    face_size = (fx2-fx1)
-                    if fa:
-                        try:
-                            faces = fa.get(face_crop)
-                            if faces and len(faces) > 0:
-                                if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
-                                    face_emb = normalize(np.array(faces[0].embedding))
-                        except:
-                            pass
-                
-                if face_emb is None and fa:
-                    try:
-                        faces = fa.get(crop_person)
-                        if faces and len(faces) > 0:
-                            f = faces[0]
-                            if hasattr(f, 'embedding') and f.embedding is not None:
-                                face_emb = normalize(np.array(f.embedding))
-                    except:
-                        pass
-                
+                face_emb, face_size = extract_face_embedding_optimized(crop_person, face_boxes_frame, box)
                 reid_emb = reid_encode(crop_person)
                 
                 # ---- Carried objects + context-aware CLIP (EXTREMELY STRICT)
+                carried_objs = []
                 carried_obj_bboxes = []
                 if detected_objects:
                     # Person body measurements for strict checks
@@ -2532,17 +2272,22 @@ while True:
                 else:
                     clip_emb = clip_encode(crop_person)
 
-                # Detect clothing colors
-                person_h, person_w = crop_person.shape[:2]
-                upper_part = mask_upper_by_face(crop_person, face_boxes_frame, box)
-                lower_part = crop_person[person_h//2:, :]
-                upper_color = get_dominant_color(upper_part)
-                lower_color = get_dominant_color(lower_part)
-                if frame_idx % max(1, DETECT_EVERY_N_FRAMES * 2) == 0:
-                    print(f"   → Colors t{current_tid}: upper={upper_color}, lower={lower_color} (crop {person_w}x{person_h})")
-                
-                # Detect person attributes
-                detected_attributes = detect_person_attributes(crop_person, None)
+                # Detect clothing colors (reduced frequency)
+                if frame_idx % 10 == 0:
+                    person_h, person_w = crop_person.shape[:2]
+                    upper_part = mask_upper_by_face(crop_person, face_boxes_frame, box)
+                    lower_part = crop_person[person_h//2:, :]
+                    upper_color = get_dominant_color(upper_part)
+                    lower_color = get_dominant_color(lower_part)
+                else:
+                    upper_color = None
+                    lower_color = None
+
+                # Detect person attributes (reduced frequency)
+                if frame_idx % 15 == 0:
+                    detected_attributes = detect_person_attributes(crop_person, None)
+                else:
+                    detected_attributes = None
 
                 t = tracklets[current_tid]
                 t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes)
@@ -2568,71 +2313,12 @@ while True:
                     next_tid += 1
                     tracklets[current_tid] = Tracklet(current_tid, box, frame_idx)
                 
-                # Face and ReID extraction (same as above)
-                face_emb = None
-                face_size = 0
-                carried_objs = []
-                
-                # Method 1: Try YOLO face boxes first
-                matched_face = None
-                for fb in face_boxes_frame:
-                    if box_inside(fb, box) or iou(fb, box) > 0.1:
-                        matched_face = fb
-                        break
-                
-                if matched_face is not None:
-                    fx1,fy1,fx2,fy2 = matched_face
-                    fx1,fy1,fx2,fy2 = max(0,fx1),max(0,fy1),min(w,fx2),min(h,fy2)
-                    face_crop = frame[fy1:fy2, fx1:fx2].copy()
-                    face_size = (fx2-fx1)
-                    
-                    if face_size < 60:
-                        upscale_factor = 4 if face_size < 30 else (3 if face_size < 45 else 2)
-                        face_crop_up = sr_enhance(face_crop, factor=upscale_factor)
-                        if fa:
-                            try:
-                                faces_up = fa.get(face_crop_up)
-                                if faces_up and len(faces_up) > 0:
-                                    if hasattr(faces_up[0], 'embedding') and faces_up[0].embedding is not None:
-                                        face_emb = normalize(np.array(faces_up[0].embedding))
-                                    if hasattr(faces_up[0], 'bbox'):
-                                        detected_w = int(faces_up[0].bbox[2] - faces_up[0].bbox[0])
-                                        if detected_w > 0:
-                                            face_size = detected_w
-                            except Exception:
-                                pass
-                    else:
-                        if fa:
-                            try:
-                                faces = fa.get(face_crop)
-                                if faces and len(faces) > 0:
-                                    if hasattr(faces[0], 'embedding') and faces[0].embedding is not None:
-                                        face_emb = normalize(np.array(faces[0].embedding))
-                                    if hasattr(faces[0], 'bbox'):
-                                        detected_w = int(faces[0].bbox[2] - faces[0].bbox[0])
-                                        if detected_w > 0:
-                                            face_size = detected_w
-                            except Exception:
-                                pass
-                
-                # Method 2: Always try InsightFace on person crop
-                if face_emb is None and fa:
-                    try:
-                        faces = fa.get(crop_person)
-                        if faces and len(faces) > 0:
-                            f = faces[0]
-                            if hasattr(f, 'bbox') and f.bbox is not None:
-                                fw = int(f.bbox[2] - f.bbox[0])
-                                face_size = max(face_size, fw)
-                            if hasattr(f, 'embedding') and f.embedding is not None:
-                                face_emb = normalize(np.array(f.embedding))
-                    except Exception:
-                        pass
-                
-                # ReID embedding
+                # Optimized face and ReID extraction
+                face_emb, face_size = extract_face_embedding_optimized(crop_person, face_boxes_frame, box)
                 reid_emb = reid_encode(crop_person)
                 
                 # ---- Carried objects + context-aware CLIP (EXTREMELY STRICT)
+                carried_objs = []
                 carried_obj_bboxes = []
                 if detected_objects:
                     # Person body measurements for strict checks
@@ -2676,17 +2362,22 @@ while True:
                 else:
                     clip_emb = clip_encode(crop_person)
                 
-                # Detect clothing colors
-                person_h, person_w = crop_person.shape[:2]
-                upper_part = mask_upper_by_face(crop_person, face_boxes_frame, box)
-                lower_part = crop_person[person_h//2:, :]
-                upper_color = get_dominant_color(upper_part)
-                lower_color = get_dominant_color(lower_part)
-                if frame_idx % max(1, DETECT_EVERY_N_FRAMES * 2) == 0:
-                    print(f"   → Colors t{current_tid}: upper={upper_color}, lower={lower_color} (crop {person_w}x{person_h})")
+                # Detect clothing colors (reduced frequency)
+                if frame_idx % 10 == 0:
+                    person_h, person_w = crop_person.shape[:2]
+                    upper_part = mask_upper_by_face(crop_person, face_boxes_frame, box)
+                    lower_part = crop_person[person_h//2:, :]
+                    upper_color = get_dominant_color(upper_part)
+                    lower_color = get_dominant_color(lower_part)
+                else:
+                    upper_color = None
+                    lower_color = None
                 
-                # Detect person attributes
-                detected_attributes = detect_person_attributes(crop_person, None)
+                # Detect person attributes (reduced frequency)
+                if frame_idx % 15 == 0:
+                    detected_attributes = detect_person_attributes(crop_person, None)
+                else:
+                    detected_attributes = None
                 
                 # Update tracklet
                 t = tracklets[current_tid]
@@ -2705,31 +2396,34 @@ while True:
             del tracklets[tid]
             continue
 
-        if not t.verified and (len(t.face_embs)+len(t.reid_embs)) >= AGGREGATION_FRAMES:
+        if not t.verified and (len(t.face_embs) + len(t.reid_embs)) >= AGGREGATION_FRAMES:
 
             face_avg = t.avg_face()
             reid_avg = t.avg_reid()
-            
+
             # Use actual detected face size instead of estimate
             face_width = t.avg_face_size()
 
-            # FACE RECOGNITION ONLY: Since reference is face-only, ReID is unreliable and disabled
+            # VERIFICATION: Use both face recognition and ReID for all tracks
             face_ok, face_score = False, None
-            
-            # Only verify via face recognition - ReID is disabled for face-only references
+            reid_ok, reid_score = False, None
+
+            # Always try face recognition if face embeddings available
             if face_avg is not None and len(t.face_embs) > 0:
                 face_ok, face_score = is_face_match(face_avg, face_width)
-                if face_ok:
-                    t.verified = True
-                    print(f"[VERIFIED] Tracklet {tid} via FACE RECOGNITION  face_score={face_score:.4f}  face_size={face_width}px  face_embs={len(t.face_embs)}")
-                else:
-                    # Face detected but doesn't match - do NOT verify (ReID disabled for face-only refs)
-                    print(f"[REJECTED] Tracklet {tid} face detected but NO MATCH (score={face_score:.4f}) - ReID disabled for face-only reference")
+
+            # Always try ReID for all tracks (enabled for all person tracks)
+            if reid_avg is not None and len(t.reid_embs) > 0:
+                reid_ok, reid_score = is_reid_match(reid_avg)
+
+            # Verification logic: Track is verified ONLY if face matches reference
+            # ReID is collected for all tracks but doesn't affect verification status
+            if face_ok:
+                t.verified = True
+                print(f"✓ Tracklet {tid} verified via face recognition")
             else:
-                # No face embeddings collected - face detection failed
-                # DO NOT use ReID as fallback when reference is face-only (unreliable)
-                print(f"[REJECTED] Tracklet {tid} NO FACE DETECTED - Cannot verify without face recognition (ReID disabled for face-only reference)")
-                print(f"  → Face embeddings: {len(t.face_embs)}, ReID embeddings: {len(t.reid_embs)}")
+                # Track remains unverified but ReID data is still collected and stored
+                pass
 
             # ByteTrack handles tracking automatically, no need for manual tracker initialization
 
