@@ -405,10 +405,10 @@ def get_dominant_color(crop):
             return "brown"
 
         # PRIORITY 1: BLACK detection (very dark)
-        black_mask = (V < 50)
+        black_mask = (V < 60)
         black_ratio = float(np.sum(black_mask) / H.size) if H.size > 0 else 0
-        
-        if v_mean < 55 or black_ratio > 0.30:
+        # Allow slightly brighter blacks to count if saturation is low (matte black) and brown is not dominant
+        if (v_mean < 65 and s_mean < 85 and brown_ratio < 0.10) or black_ratio > 0.25:
             return "black"
 
         # PRIORITY 2: WHITE detection (very bright + desaturated)

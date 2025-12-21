@@ -15,6 +15,7 @@ from qdrant_client.models import Distance, VectorParams, NamedVector
 from dotenv import load_dotenv
 import os
 import qdrant_collections  # for collection constants
+from PIL import Image
 
 # Load environment variables
 load_dotenv()
@@ -105,12 +106,13 @@ try:
 except Exception as e:
     print(f"ByteTrack not available: {e}")
     USE_BYTETRACK = False
+    
 
 # ----------------------
 # CONFIG (CPU OPTIMIZED)
 # ----------------------
 VIDEO_PATH = "combined.mp4"
-REF_FACE_PATHS = ["zeeshan.jpg"]
+REF_FACE_PATHS = ["sabbas.jpg"]
 
 YOLO_PERSON_MODEL = "yolov8m.pt"        # your person model
 YOLO_FACE_MODEL = "yolov8m-face.pt"     # recommended: yolov8n-face or yolov8m-face
@@ -139,6 +141,20 @@ IOU_THRESHOLD = 0.40
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Using device:", DEVICE)
 print("Real-ESRGAN available:", USE_REAL_ESRGAN)
+
+# CLIP for text-image embeddings (load after DEVICE is defined)
+USE_CLIP = False
+clip_model = None
+clip_preprocess = None
+try:
+    import clip
+    clip_model, clip_preprocess = clip.load("ViT-B/32", device=DEVICE)
+    clip_model.eval()
+    USE_CLIP = True
+    print("CLIP model loaded (ViT-B/32)")
+except Exception as e:
+    print(f"CLIP not available: {e}")
+    USE_CLIP = False
 
 # ----------------------
 # LOAD MODELS
@@ -283,6 +299,21 @@ def reid_encode(img):
             return None
     
     return None
+
+def clip_encode(img):
+    """Encode a BGR image using CLIP; returns normalized embedding or None."""
+    if not USE_CLIP or clip_model is None or clip_preprocess is None:
+        return None
+    try:
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        with torch.no_grad():
+            image_tensor = clip_preprocess(pil_img).unsqueeze(0).to(DEVICE)
+            features = clip_model.encode_image(image_tensor)
+            features = features / (features.norm(dim=-1, keepdim=True) + 1e-8)
+        return features.squeeze().cpu().numpy().astype(np.float32)
+    except Exception:
+        return None
 
 # ----------------------
 # Build reference embeddings
@@ -474,13 +505,14 @@ from datetime import datetime
 
 def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, frame_rate=30.0):
     """
-    Insert a verified tracklet into Qdrant person_tracks collection.
+    Insert a tracklet into Qdrant person_tracks collection.
     
     Stores averaged face and ReID embeddings with metadata for similarity search.
+    Works for both verified and unverified tracklets.
     
     Args:
         client: QdrantClient instance
-        tracklet: Tracklet object with verified=True, avg face/reid embeddings
+        tracklet: Tracklet object (verified or unverified) with avg face/reid embeddings
         video_id: Video ID from PostgreSQL videos table
         segment_id: Optional segment ID for video_segments table link
         frame_rate: Video frame rate for time calculations
@@ -488,38 +520,48 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
     Returns:
         bool: True if insertion succeeded, False otherwise
     """
-    if not tracklet.verified or not client:
+    if not client:
         return False
     
     try:
-        # Get averaged embeddings
+        # Get averaged embeddings (may be None for unverified tracklets)
         face_avg = tracklet.avg_face()
         reid_avg = tracklet.avg_reid()
         
-        if face_avg is None or reid_avg is None:
+        # For unverified tracklets, we still need at least ReID embedding to insert
+        # If both are None, skip insertion (no useful data)
+        if face_avg is None and reid_avg is None:
+            print(f"⚠ Skipping tracklet {tracklet.id} - no embeddings available")
             return False
+        
+        # Use zero vectors as fallback if embeddings are missing
+        if face_avg is None:
+            face_avg = np.zeros(512, dtype=np.float32)
+        if reid_avg is None:
+            reid_avg = np.zeros(512, dtype=np.float32)
         
         # Generate unique ID for this tracklet entry
         point_id = str(uuid.uuid4())
         
-        # Calculate time range (start_frame and end_frame from tracklet.bboxes timeline)
-        start_frame = 0  # First frame this tracklet appeared
-        end_frame = tracklet.last_frame if hasattr(tracklet, 'last_frame') else 0
-        num_frames = end_frame - start_frame
+        # Calculate time range based on when the tracklet first/last appeared
+        start_frame = tracklet.first_frame if hasattr(tracklet, 'first_frame') else 0
+        end_frame = tracklet.last_frame if hasattr(tracklet, 'last_frame') else start_frame
+        num_frames = max(1, end_frame - start_frame + 1)
         
         # Estimate time in seconds using frame rate
         start_time_sec = start_frame / max(frame_rate, 1.0)
         end_time_sec = end_frame / max(frame_rate, 1.0)
         
-        # Format as HH:MM:SS
-        def seconds_to_hms(secs):
+        # Format as HH:MM:SS.mmm (keep milliseconds to avoid truncation)
+        def seconds_to_hms_ms(secs):
             h = int(secs // 3600)
             m = int((secs % 3600) // 60)
             s = int(secs % 60)
-            return f"{h:02d}:{m:02d}:{s:02d}"
+            ms = int((secs - int(secs)) * 1000)
+            return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
         
-        start_time_str = seconds_to_hms(start_time_sec)
-        end_time_str = seconds_to_hms(end_time_sec)
+        start_time_str = seconds_to_hms_ms(start_time_sec)
+        end_time_str = seconds_to_hms_ms(end_time_sec)
         
         # Build payload per spec (NO camera_id)
         payload = {
@@ -540,27 +582,73 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
         payload["person_gender"] = None
         payload["upper_color"] = None
         payload["lower_color"] = None
-        payload["object_carried"] = []
+        payload["object_carried"] = tracklet.carried_summary()
+        payload["verified"] = tracklet.verified  # Indicate if this tracklet was verified against reference
         
         # Convert embeddings to lists for Qdrant
         face_vec = face_avg.tolist() if isinstance(face_avg, np.ndarray) else list(face_avg)
         reid_vec = reid_avg.tolist() if isinstance(reid_avg, np.ndarray) else list(reid_avg)
         
-        # For multi_vec (CLIP placeholder): pad 512D to 768D with zeros
-        # (Schema expects 768D; once CLIP is implemented, replace with actual CLIP embedding)
-        def pad_to_768(vec_512):
-            """Pad 512D vector to 768D by appending zeros."""
-            vec_list = vec_512.tolist() if isinstance(vec_512, np.ndarray) else list(vec_512)
+        # multi_vec: prefer CLIP embedding, fallback to face embedding padded to 768
+        clip_avg = tracklet.avg_clip()
+
+        def pad_to_768(vec):
+            """Pad vector to 768D by appending zeros."""
+            vec_list = vec.tolist() if isinstance(vec, np.ndarray) else list(vec)
+            if len(vec_list) >= 768:
+                return vec_list[:768]
             return vec_list + [0.0] * (768 - len(vec_list))
         
-        multi_vec = pad_to_768(face_avg)
+        if clip_avg is not None:
+            multi_vec = pad_to_768(clip_avg)
+        else:
+            multi_vec = pad_to_768(face_avg)
         
         # Build vectors dict for NamedVectors (per spec: face_vec 512D, reid_vec 512D, multi_vec 768D)
         vectors = {
             "face_vec": face_vec,          # 512D (InsightFace)
             "reid_vec": reid_vec,          # 512D (TorchReID)
-            "multi_vec": multi_vec,        # 768D (CLIP placeholder, padded from face_vec)
+            "multi_vec": multi_vec,        # 768D (CLIP or padded face_vec)
         }
+        
+        # DEBUG: Print what's being sent to Qdrant
+        print("\n" + "="*80)
+        print(f"🔍 DEBUG: Inserting Tracklet {tracklet.id} to Qdrant ({'VERIFIED' if tracklet.verified else 'UNVERIFIED'})")
+        print("="*80)
+        print(f"Point ID: {point_id}")
+        print(f"\n📦 PAYLOAD:")
+        print(f"  video_id: {payload['video_id']}")
+        print(f"  track_id: {payload['track_id']}")
+        print(f"  start_time: {payload['start_time']}")
+        print(f"  end_time: {payload['end_time']}")
+        print(f"  num_frames: {payload['num_frames']}")
+        print(f"  avg_confidence: {payload['avg_confidence']}")
+        print(f"  timestamp: {payload['timestamp']}")
+        print(f"  person_gender: {payload['person_gender']}")
+        print(f"  upper_color: {payload['upper_color']}")
+        print(f"  lower_color: {payload['lower_color']}")
+        print(f"  object_carried: {payload['object_carried']}")
+        print(f"  verified: {payload['verified']}")
+        if 'segment_id' in payload:
+            print(f"  segment_id: {payload['segment_id']}")
+        
+        print(f"\n🔢 VECTORS:")
+        face_status = "InsightFace" if len(tracklet.face_embs) > 0 else "Zero (no face detected)"
+        reid_status = "TorchReID/ResNet50" if len(tracklet.reid_embs) > 0 else "Zero (no ReID)"
+        print(f"  face_vec: {len(face_vec)}D ({face_status})")
+        print(f"    Sample: [{face_vec[0]:.6f}, {face_vec[1]:.6f}, {face_vec[2]:.6f}, ...]")
+        print(f"  reid_vec: {len(reid_vec)}D ({reid_status})")
+        print(f"    Sample: [{reid_vec[0]:.6f}, {reid_vec[1]:.6f}, {reid_vec[2]:.6f}, ...]")
+        print(f"  multi_vec: {len(multi_vec)}D ({'CLIP' if clip_avg is not None else 'Face (padded)'})")
+        print(f"    Sample: [{multi_vec[0]:.6f}, {multi_vec[1]:.6f}, {multi_vec[2]:.6f}, ...]")
+        
+        print(f"\n📊 TRACKLET STATS:")
+        print(f"  Verified: {tracklet.verified}")
+        print(f"  Face embeddings collected: {len(tracklet.face_embs)}")
+        print(f"  ReID embeddings collected: {len(tracklet.reid_embs)}")
+        print(f"  CLIP embeddings collected: {len(tracklet.clip_embs)}")
+        print(f"  Carried objects observed: {len(tracklet.carried_objects)}")
+        print("="*80 + "\n")
         
         # Insert into Qdrant
         from qdrant_client.models import PointStruct
@@ -575,7 +663,8 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
             points=[point]
         )
         
-        print(f"✅ Inserted tracklet {tracklet.id} to Qdrant (ID: {point_id})")
+        status = "VERIFIED" if tracklet.verified else "UNVERIFIED"
+        print(f"✅ Inserted {status} tracklet {tracklet.id} to Qdrant (ID: {point_id})")
         return True
         
     except Exception as e:
@@ -590,14 +679,18 @@ class Tracklet:
         self.id = tid
         self.bboxes = deque(maxlen=AGGREGATION_FRAMES)
         self.bboxes.append(bbox)
+        self.first_frame = frame_idx
         self.last_frame = frame_idx
         self.face_embs = []
         self.face_sizes = []  # Store actual detected face sizes
         self.reid_embs = []
+        self.clip_embs = []
+        self.carried_objects = deque(maxlen=50)  # recent object class names observed with this person
         self.verified = False
+        self.inserted = False  # set True once pushed to DB
         self.tracker = None
 
-    def update(self, bbox, idx, face_emb=None, reid_emb=None, face_size=0):
+    def update(self, bbox, idx, face_emb=None, reid_emb=None, face_size=0, clip_emb=None, carried=None):
         self.bboxes.append(bbox)
         self.last_frame = idx
         if face_emb is not None: 
@@ -605,6 +698,14 @@ class Tracklet:
             if face_size > 0:
                 self.face_sizes.append(face_size)
         if reid_emb is not None: self.reid_embs.append(reid_emb)
+        if clip_emb is not None: self.clip_embs.append(clip_emb)
+        if carried:
+            # carried can be a list or single string
+            if isinstance(carried, (list, tuple)):
+                for name in carried:
+                    self.carried_objects.append(name)
+            else:
+                self.carried_objects.append(carried)
 
     def avg_face(self):
         if not self.face_embs: return None
@@ -616,6 +717,12 @@ class Tracklet:
         avg = np.mean(self.reid_embs, axis=0)
         return normalize(avg)
     
+    def avg_clip(self):
+        if not self.clip_embs:
+            return None
+        avg = np.mean(self.clip_embs, axis=0)
+        return normalize(avg)
+    
     def avg_face_size(self):
         """Get average detected face size, or estimate from bbox if no sizes recorded"""
         if self.face_sizes:
@@ -625,6 +732,17 @@ class Tracklet:
             last = self.bboxes[-1]
             return max(20, (last[2] - last[0]) // 4)  # Conservative estimate
         return 0
+    
+    def carried_summary(self):
+        """Return unique list of carried object names."""
+        if not self.carried_objects:
+            return []
+        # Preserve insertion order of most recent observations
+        seen = {}
+        for name in self.carried_objects:
+            if name not in seen:
+                seen[name] = True
+        return list(seen.keys())
 
 # ----------------------
 # ObjectTracklet class (for objects like backpacks, laptops, etc.)
@@ -1123,6 +1241,7 @@ while True:
                 # ---- Face detection: Try multiple methods for best results
                 face_emb = None
                 face_size = 0
+                carried_objs = []
 
                 # Method 1: Try YOLO face boxes first (if available)
                 matched_face = None
@@ -1324,11 +1443,20 @@ while True:
 
                 # ---- ReID embedding (on person crop)
                 reid_emb = reid_encode(crop_person)
+                
+                # ---- CLIP embedding (on person crop)
+                clip_emb = clip_encode(crop_person)
+
+                # ---- Carried objects association (objects whose center lies in person box or good IoU)
+                if detected_objects:
+                    for class_name, obj_bbox, obj_conf in detected_objects:
+                        if box_inside(obj_bbox, vis_bbox) or iou(obj_bbox, vis_bbox) > 0.2:
+                            carried_objs.append(class_name)
 
                 # Update tracklet with face and ReID embeddings
                 # Use vis_bbox (person detection box) for accurate visualization
                 t = tracklets[current_tid]
-                t.update(vis_bbox, frame_idx, face_emb, reid_emb, face_size)
+                t.update(vis_bbox, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs)
                 
                 # Debug output for first few detections
                 if frame_idx <= DETECT_EVERY_N_FRAMES * 3:
@@ -1432,8 +1560,16 @@ while True:
                         pass
                 
                 reid_emb = reid_encode(crop_person)
+                
+                clip_emb = clip_encode(crop_person)
+                
+                if detected_objects:
+                    for class_name, obj_bbox, obj_conf in detected_objects:
+                        if box_inside(obj_bbox, box) or iou(obj_bbox, box) > 0.2:
+                            carried_objs.append(class_name)
+
                 t = tracklets[current_tid]
-                t.update(box, frame_idx, face_emb, reid_emb, face_size)
+                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs)
         
         # Fallback: If ByteTrack is not available or no tracked objects, use IOU-based matching
         if not USE_BYTETRACK or len(tracked_objects) == 0:
@@ -1459,6 +1595,7 @@ while True:
                 # Face and ReID extraction (same as above)
                 face_emb = None
                 face_size = 0
+                carried_objs = []
                 
                 # Method 1: Try YOLO face boxes first
                 matched_face = None
@@ -1519,16 +1656,27 @@ while True:
                 # ReID embedding
                 reid_emb = reid_encode(crop_person)
                 
+                clip_emb = clip_encode(crop_person)
+                
+                if detected_objects:
+                    for class_name, obj_bbox, obj_conf in detected_objects:
+                        if box_inside(obj_bbox, box) or iou(obj_bbox, box) > 0.2:
+                            carried_objs.append(class_name)
+                
                 # Update tracklet
                 t = tracklets[current_tid]
-                t.update(box, frame_idx, face_emb, reid_emb, face_size)
+                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs)
 
     # --------------------------
-    # Verification logic (unchanged)
+    # Verification logic and tracklet insertion
     # --------------------------
     for tid, t in list(tracklets.items()):
 
         if frame_idx - t.last_frame > TRACKLET_MAX_AGE:
+            # Track has ended (no updates for TRACKLET_MAX_AGE frames)
+            # Insert ALL tracklets (verified and unverified) when they end
+            if not t.inserted and client:
+                t.inserted = insert_tracklet_to_qdrant(client, t, video_id=1, segment_id=None, frame_rate=30.0)
             del tracklets[tid]
             continue
 
@@ -1549,9 +1697,6 @@ while True:
                 if face_ok:
                     t.verified = True
                     print(f"[VERIFIED] Tracklet {tid} via FACE RECOGNITION  face_score={face_score:.4f}  face_size={face_width}px  face_embs={len(t.face_embs)}")
-                    # Insert to Qdrant for vector database storage
-                    if client:
-                        insert_tracklet_to_qdrant(client, t, video_id=1, segment_id=None, frame_rate=30.0)
                 else:
                     # Face detected but doesn't match - do NOT verify (ReID disabled for face-only refs)
                     print(f"[REJECTED] Tracklet {tid} face detected but NO MATCH (score={face_score:.4f}) - ReID disabled for face-only reference")
@@ -1615,6 +1760,11 @@ while True:
     cv2.imshow("Hybrid Face+ReID CPU Pipeline (YOLO-face integrated)", vis)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
+
+# After loop ends, insert any remaining tracklets (verified and unverified) that were not inserted yet
+for tid, t in list(tracklets.items()):
+    if not t.inserted and client:
+        t.inserted = insert_tracklet_to_qdrant(client, t, video_id=1, segment_id=None, frame_rate=30.0)
 
 cap.release()
 cv2.destroyAllWindows()
