@@ -7,6 +7,8 @@ from collections import deque
 import numpy as np
 import cv2
 import torch
+import warnings
+warnings.filterwarnings('ignore')
 import torchvision.transforms as T
 from torchvision.models import resnet50
 from ultralytics import YOLO
@@ -2226,6 +2228,7 @@ while True:
                 reid_emb = reid_encode(crop_person)
                 
                 # ---- Carried objects + context-aware CLIP (EXTREMELY STRICT)
+                carried_objs = []
                 carried_obj_bboxes = []
                 if detected_objects:
                     # Person body measurements for strict checks
