@@ -90,7 +90,6 @@ class VideoProcessingWorkflow:
                 process_video_activity,
                 download_result,
                 start_to_close_timeout=timedelta(hours=2),  # 2 hours for processing
-                heartbeat_timeout=timedelta(seconds=30),  # Expect heartbeat every 30s
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(seconds=5),
                     maximum_interval=timedelta(minutes=5),

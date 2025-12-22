@@ -21,6 +21,29 @@ from botocore.client import Config
 from dotenv import load_dotenv
 import subprocess
 import json
+from datetime import datetime
+
+BACKEND_INTERNAL_URL = os.getenv("BACKEND_INTERNAL_URL", "http://localhost:3000/internal/workflow-callback")
+WORKER_CALLBACK_TOKEN = os.getenv("WORKER_CALLBACK_TOKEN", None)
+
+def _post_status_update(video_id: int, stage: str, message: str = None, status: str = "info", error: str = None, details: dict = None):
+    try:
+        headers = {"Content-Type": "application/json"}
+        if WORKER_CALLBACK_TOKEN:
+            headers["x-worker-token"] = WORKER_CALLBACK_TOKEN
+        payload = {
+            "video_id": video_id,
+            "stage": stage,
+            "message": message,
+            "status": status,
+            "error": error,
+            "workflow_id": getattr(activity.info, 'workflow_id', None),
+            "workflow_run_id": getattr(activity.info, 'workflow_run_id', None),
+            "details": details or {}
+        }
+        requests.post(BACKEND_INTERNAL_URL, json=payload, headers=headers, timeout=10)
+    except Exception as e:
+        activity.logger.warning(f"Callback post failed: {e}")
 
 # Load environment variables from backend .env file
 # Try multiple locations in case of different working directories
@@ -93,6 +116,9 @@ async def download_video_activity(video_data: Dict[str, Any]) -> Dict[str, Any]:
     activity.logger.info(f"Starting video download for video_id: {video_data['video_id']}")
     
     try:
+        # Callback: stage started
+        _post_status_update(video_data['video_id'], 'downloading', 'Download started')
+
         # S3 Configuration
         ACCESS_KEY = os.getenv("S3_ACCESS_KEY_ID")
         SECRET_KEY = os.getenv("S3_SECRET_ACCESS_KEY")
@@ -165,6 +191,7 @@ async def download_video_activity(video_data: Dict[str, Any]) -> Dict[str, Any]:
                         activity.heartbeat({"progress": percent, "bytes_downloaded": downloaded_size})
         
         activity.logger.info(f"[DOWNLOAD-COMPLETE] Downloaded {downloaded_size} bytes to {local_path}")
+        _post_status_update(video_data['video_id'], 'preprocessing', 'Download complete', details={"bytes": downloaded_size, "path": local_path})
         
         return {
             "video_id": video_data['video_id'],
@@ -175,6 +202,7 @@ async def download_video_activity(video_data: Dict[str, Any]) -> Dict[str, Any]:
         
     except Exception as e:
         activity.logger.error(f"❌ Error downloading video: {e}")
+        _post_status_update(video_data.get('video_id', -1), 'failed', 'Download failed', status='error', error=str(e))
         raise
 
 
@@ -200,6 +228,9 @@ async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, A
     activity.logger.info(f"[PROCESS-FILE] Processing file: {local_path}")
     
     try:
+        # Callback: processing start
+        _post_status_update(video_id, 'analysis', 'Processing started', details={"file": local_path})
+
         # Verify file exists
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"Video file not found: {local_path}")
@@ -241,6 +272,15 @@ async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, A
                 process.communicate(), 
                 timeout=3600  # 1 hour timeout
             )
+        except asyncio.CancelledError:
+            activity.logger.error(f"Processing cancelled (timeout or workflow cancellation) for video_id: {video_id}")
+            _post_status_update(video_id, 'failed', 'Processing cancelled', status='error')
+            try:
+                process.kill()
+                await asyncio.wait_for(process.communicate(), timeout=5)
+            except Exception as kill_err:
+                activity.logger.warning(f"Failed to cleanly kill pipeline process: {kill_err}")
+            raise
         finally:
             heartbeat_task.cancel()
         
@@ -263,6 +303,7 @@ async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, A
         # For now, we'll leave them as 0 and update later
         
         activity.logger.info(f"✅ Video processing complete for video_id: {video_id}")
+        _post_status_update(video_id, 'postprocessing', 'Processing complete')
         
         return {
             "video_id": video_id,
@@ -274,10 +315,12 @@ async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, A
         
     except asyncio.TimeoutError:
         activity.logger.error(f"❌ Processing timeout for video_id: {video_id}")
+        _post_status_update(video_id, 'failed', 'Processing timeout', status='error')
         raise RuntimeError("Video processing timeout (exceeded 1 hour)")
     
     except Exception as e:
         activity.logger.error(f"❌ Error processing video: {e}")
+        _post_status_update(video_id, 'failed', 'Processing failed', status='error', error=str(e))
         raise
 
 
@@ -380,6 +423,7 @@ async def store_results_activity(processing_result: Dict[str, Any]) -> Dict[str,
                 activity.logger.warning(f"Could not delete video file: {e}")
         
         activity.logger.info(f"✅ Results verified and stored for video_id: {video_id}")
+        _post_status_update(video_id, 'completed', 'Results stored', details={"persons": person_count.count, "objects": object_count.count})
         
         return {
             "video_id": video_id,
@@ -391,6 +435,7 @@ async def store_results_activity(processing_result: Dict[str, Any]) -> Dict[str,
         
     except Exception as e:
         activity.logger.error(f"❌ Error verifying Qdrant storage: {e}")
+        _post_status_update(video_id, 'completed', 'Storage verification failed', status='warning', error=str(e))
         # Don't fail the workflow if verification fails, just log it
         return {
             "video_id": video_id,
