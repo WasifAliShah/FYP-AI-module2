@@ -148,14 +148,6 @@
 #             return []
         
 #         out = []
-#         for t in tracks:
-#             # For persons: only return confirmed tracks to avoid ID churn
-#             # For objects: return all tracks for immediate tracking
-#             if self.require_confirmation and not t.is_confirmed():
-#                 continue
-            
-#             tlbr = t.to_tlbr()  # [x1,y1,x2,y2]
-#             out.append(type('BTTrack', (), {
 #                 'track_id': t.track_id,
 #                 'tlbr': tlbr
 #             }))
@@ -3598,6 +3590,12 @@ try:
     VIDEO_ID = int(os.environ.get("VIDEO_ID", "1"))
 except Exception:
     VIDEO_ID = 1
+
+# ===== FACE COMPARISON MODE =====
+# Set to True for real-time face comparison during video processing (legacy mode)
+# Set to False for post-processing face comparison after video is complete
+REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "false").lower() == "false"
+print(f"Face comparison mode: {'REAL-TIME' if REALTIME_FACE_COMPARISON else 'POST-PROCESSING'}")
 REF_FACE_PATHS = ["sabbas.jpg"]
 
 YOLO_PERSON_MODEL = "yolov8m.pt"        # your person model
@@ -4085,40 +4083,57 @@ def normalize(v):
     v = v.astype(np.float32)
     return v / (np.linalg.norm(v)+1e-8)
 
-for path in REF_FACE_PATHS:
-    img = cv2.imread(path)
-    if img is None:
-        print("Warning: could not load reference image", path)
-        continue
+if REALTIME_FACE_COMPARISON:
+    # REAL-TIME MODE: Load reference face embeddings for comparison during processing
+    print("\n" + "="*80)
+    print("🔴 REAL-TIME FACE COMPARISON MODE")
+    print("="*80)
+    print("Loading reference face images for real-time verification...")
+    
+    for path in REF_FACE_PATHS:
+        img = cv2.imread(path)
+        if img is None:
+            print("Warning: could not load reference image", path)
+            continue
 
-    # face embedding
-    face_emb = None
-    if fa:
-        faces = fa.get(img)
-        if faces and len(faces) > 0:
-            face_emb = normalize(np.array(faces[0].embedding))
-            ref_face_embs.append(face_emb)
-            print(f"✓ Reference face loaded: {len(face_emb)}D")
+        # face embedding
+        face_emb = None
+        if fa:
+            faces = fa.get(img)
+            if faces and len(faces) > 0:
+                face_emb = normalize(np.array(faces[0].embedding))
+                ref_face_embs.append(face_emb)
+                print(f"✓ Reference face loaded: {len(face_emb)}D")
+            else:
+                print(f"⚠ Warning: No face detected in reference image {path} - face recognition will not work!")
         else:
-            print(f"⚠ Warning: No face detected in reference image {path} - face recognition will not work!")
-    else:
-        print("⚠ Warning: InsightFace not available - face recognition disabled!")
+            print("⚠ Warning: InsightFace not available - face recognition disabled!")
 
-    # reid embedding
-    reid_emb = reid_encode(img)
-    if reid_emb is not None:
-        ref_reid_embs.append(reid_emb)
-        print(f"✓ Reference ReID loaded: {len(reid_emb)}D")
+        # reid embedding
+        reid_emb = reid_encode(img)
+        if reid_emb is not None:
+            ref_reid_embs.append(reid_emb)
+            print(f"✓ Reference ReID loaded: {len(reid_emb)}D")
 
-# Determine if reference is face-only (affects verification strategy)
-USE_REID_FOR_ALL_TRACKS = True  # Enable ReID collection for all tracks regardless of verification status
-USE_REID_VERIFICATION = len(ref_face_embs) > 0 and len(ref_reid_embs) > 0
-# If we have face embeddings, enable strict face-based verification
-if len(ref_face_embs) > 0:
-    print("⚠ IMPORTANT: Reference contains face images. STRICT face verification enabled.")
-    print("   Only face matches = VERIFIED. ReID collected for all tracks but doesn't affect verification.")
-    USE_REID_VERIFICATION = True
-print("=" * 40 + "\n")
+    # Determine if reference is face-only (affects verification strategy)
+    USE_REID_FOR_ALL_TRACKS = True  # Enable ReID collection for all tracks regardless of verification status
+    USE_REID_VERIFICATION = len(ref_face_embs) > 0 and len(ref_reid_embs) > 0
+    # If we have face embeddings, enable strict face-based verification
+    if len(ref_face_embs) > 0:
+        print("⚠ IMPORTANT: Reference contains face images. STRICT face verification enabled.")
+        print("   Only face matches = VERIFIED. ReID collected for all tracks but doesn't affect verification.")
+        USE_REID_VERIFICATION = True
+    print("="*80 + "\n")
+else:
+    # POST-PROCESSING MODE: Skip reference loading, all tracks stored as unverified
+    print("\n" + "="*80)
+    print("🟢 POST-PROCESSING FACE COMPARISON MODE")
+    print("="*80)
+    print("All person tracks will be stored in Qdrant WITHOUT verification.")
+    print("Use compare_face_after_processing() after video processing to find matches.")
+    print("="*80 + "\n")
+    USE_REID_FOR_ALL_TRACKS = True
+    USE_REID_VERIFICATION = False
 
 # ===== DEBUG: Identify embedding dimensions =====
 FACE_EMBEDDING_DIM = len(ref_face_embs[0]) if len(ref_face_embs) > 0 else None
@@ -5282,7 +5297,7 @@ while True:
                         # Insert to Qdrant before removing
                         obj_track = object_tracklets[oid]
                         if not obj_track.inserted and client:
-                            obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None, frame_rate=30.0)
+                            obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=VIDEO_ID, segment_id=None, frame_rate=30.0)
                         del object_tracklets[oid]
                     
                     if frame_idx <= 50:  # Only first 50 frames
@@ -5391,7 +5406,7 @@ while True:
                     # Insert to Qdrant before removing
                     obj_track = object_tracklets[oid]
                     if not obj_track.inserted and client:
-                        obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None, frame_rate=30.0)
+                        obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=VIDEO_ID, segment_id=None, frame_rate=30.0)
                     del object_tracklets[oid]
             except Exception as e:
                 pass  # ByteTrack update failed, continue
@@ -5822,7 +5837,7 @@ while True:
             # Track has ended (no updates for TRACKLET_MAX_AGE frames)
             # Insert ALL tracklets (verified and unverified) when they end
             if not t.inserted and client:
-                t.inserted = insert_tracklet_to_qdrant(client, t, video_id=1, segment_id=None, frame_rate=30.0)
+                t.inserted = insert_tracklet_to_qdrant(client, t, video_id=VIDEO_ID, segment_id=None, frame_rate=30.0)
             del tracklets[tid]
             continue
 
@@ -5834,25 +5849,32 @@ while True:
             # Use actual detected face size instead of estimate
             face_width = t.avg_face_size()
 
-            # VERIFICATION: Use both face recognition and ReID for all tracks
-            face_ok, face_score = False, None
-            reid_ok, reid_score = False, None
+            # VERIFICATION: Only run in REAL-TIME mode
+            if REALTIME_FACE_COMPARISON:
+                # REAL-TIME MODE: Compare against reference face
+                face_ok, face_score = False, None
+                reid_ok, reid_score = False, None
 
-            # Always try face recognition if face embeddings available
-            if face_avg is not None and len(t.face_embs) > 0:
-                face_ok, face_score = is_face_match(face_avg, face_width)
+                # Always try face recognition if face embeddings available
+                if face_avg is not None and len(t.face_embs) > 0:
+                    face_ok, face_score = is_face_match(face_avg, face_width)
 
-            # Always try ReID for all tracks (enabled for all person tracks)
-            if reid_avg is not None and len(t.reid_embs) > 0:
-                reid_ok, reid_score = is_reid_match(reid_avg)
+                # Always try ReID for all tracks (enabled for all person tracks)
+                if reid_avg is not None and len(t.reid_embs) > 0:
+                    reid_ok, reid_score = is_reid_match(reid_avg)
 
-            # Verification logic: Track is verified ONLY if face matches reference
-            # ReID is collected for all tracks but doesn't affect verification status
-            if face_ok:
-                t.verified = True
-                print(f"✓ Tracklet {tid} verified via face recognition")
+                # Verification logic: Track is verified ONLY if face matches reference
+                # ReID is collected for all tracks but doesn't affect verification status
+                if face_ok:
+                    t.verified = True
+                    print(f"✓ Tracklet {tid} verified via face recognition")
+                else:
+                    # Track remains unverified but ReID data is still collected and stored
+                    pass
             else:
-                # Track remains unverified but ReID data is still collected and stored
+                # POST-PROCESSING MODE: Skip verification, all tracks remain unverified
+                # All tracks will be stored in Qdrant with verified=False
+                # Use compare_face_after_processing() later to find matches
                 pass
 
             # ByteTrack handles tracking automatically, no need for manual tracker initialization
@@ -6455,6 +6477,221 @@ def query_tracklets_by_text(text_prompt, top_k=5):
 
 
 # ========================
+# POST-PROCESSING FACE COMPARISON
+# ========================
+def compare_face_after_processing(reference_image_path, video_id=None, top_k=10):
+    """
+    Post-processing face comparison mode.
+    After video processing is complete, this function:
+    1. Takes a reference face image
+    2. Generates face embedding using InsightFace
+    3. Queries Qdrant person_tracks collection for similar face embeddings
+    4. Returns the most similar matches
+    
+    Args:
+        reference_image_path: Path to reference face image
+        video_id: Optional video_id to filter results (None = search all videos)
+        top_k: Number of top matches to return
+    
+    Returns:
+        List of (track_id, similarity_score, payload) tuples
+    """
+    try:
+        print("\n" + "="*80)
+        print("🔍 POST-PROCESSING FACE COMPARISON")
+        print("="*80)
+        print(f"Reference image: {reference_image_path}")
+        if video_id:
+            print(f"Filtering by video_id: {video_id}")
+        print(f"Top results: {top_k}")
+        print("="*80 + "\n")
+        
+        # Load reference image
+        ref_img = cv2.imread(reference_image_path)
+        if ref_img is None:
+            print(f"❌ Error: Could not load reference image: {reference_image_path}")
+            return []
+        
+        print(f"✓ Loaded reference image: {ref_img.shape[1]}x{ref_img.shape[0]}")
+        
+        # Initialize InsightFace if not already done
+        from insightface.app import FaceAnalysis
+        fa_temp = FaceAnalysis(allowed_modules=['detection', 'recognition'])
+        fa_temp.prepare(ctx_id=-1, det_size=(640, 640))
+        print("✓ InsightFace initialized")
+        
+        # Extract face embedding from reference image
+        faces = fa_temp.get(ref_img)
+        if not faces or len(faces) == 0:
+            print("❌ Error: No face detected in reference image")
+            return []
+        
+        # Use the first face (largest)
+        ref_face = faces[0]
+        ref_embedding = np.array(ref_face.embedding, dtype=np.float32)
+        
+        # Normalize embedding
+        ref_embedding = ref_embedding / (np.linalg.norm(ref_embedding) + 1e-8)
+        
+        print(f"✓ Extracted face embedding: {len(ref_embedding)}D")
+        print(f"  Face confidence: {ref_face.det_score:.4f}")
+        print(f"  Face bbox: {ref_face.bbox}")
+        
+        # Query Qdrant for similar faces
+        print("\n🔎 Searching Qdrant person_tracks collection...")
+        
+        # Build filter if video_id specified
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        search_filter = None
+        if video_id is not None:
+            search_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="video_id",
+                        match=MatchValue(value=video_id)
+                    )
+                ]
+            )
+        
+        # Search using face_vec vector (matches Qdrant named vectors schema)
+        try:
+            search_results = client.query_points(
+                collection_name="person_tracks",
+                query=ref_embedding.tolist(),
+                using="face_vec",
+                query_filter=search_filter,
+                limit=top_k,
+                with_payload=True
+            ).points
+        except AttributeError:
+            # Fallback for older qdrant-client versions
+            try:
+                from qdrant_client.models import PointStruct, SearchRequest
+                search_results = client.search(
+                    collection_name="person_tracks",
+                    query_vector=("face_vec", ref_embedding.tolist()),
+                    query_filter=search_filter,
+                    limit=top_k,
+                    with_payload=True
+                )
+            except Exception:
+                # Try another method for even older versions
+                search_results = client.search(
+                    collection_name="person_tracks",
+                    query_vector=ref_embedding.tolist(),
+                    query_filter=search_filter,
+                    limit=top_k,
+                    with_payload=True,
+                    search_params={"hnsw_ef": 128, "exact": False}
+                )
+
+        # If filtered search returned zero, try without filter to help diagnose mismatched video_id
+        if not search_results and search_filter is not None:
+            print("⚠ No results with video_id filter — retrying without filter to diagnose...")
+            try:
+                search_results = client.query_points(
+                    collection_name="person_tracks",
+                    query=ref_embedding.tolist(),
+                    using="face_vec",
+                    limit=top_k,
+                    with_payload=True
+                ).points
+            except AttributeError:
+                try:
+                    search_results = client.search(
+                        collection_name="person_tracks",
+                        query_vector=("face_vec", ref_embedding.tolist()),
+                        limit=top_k,
+                        with_payload=True
+                    )
+                except:
+                    search_results = client.search(
+                        collection_name="person_tracks",
+                        query_vector=ref_embedding.tolist(),
+                        limit=top_k,
+                        with_payload=True,
+                        search_params={"hnsw_ef": 128, "exact": False}
+                    )
+            except:
+                # Try another method for even older versions
+                search_results = client.search(
+                    collection_name="person_tracks",
+                    query_vector=ref_embedding.tolist(),
+                    query_filter=search_filter,
+                    limit=top_k,
+                    with_payload=True,
+                    search_params={"hnsw_ef": 128, "exact": False}
+                )
+        
+        print(f"✓ Found {len(search_results)} matches\n")
+        
+        # Process and display results
+        matches = []
+        print(f"{'='*80}")
+        print(f"📊 TOP {len(search_results)} FACE MATCHES")
+        print(f"{'='*80}")
+        
+        for idx, result in enumerate(search_results, 1):
+            similarity_score = result.score  # Cosine similarity
+            payload = result.payload
+            
+            track_id = payload.get("track_id", "Unknown")
+            video_id_result = payload.get("video_id", "Unknown")
+            start_time = payload.get("start_time", "Unknown")
+            end_time = payload.get("end_time", "Unknown")
+            num_frames = payload.get("num_frames", 0)
+            verified = payload.get("verified", False)
+            carried_objs = payload.get("object_carried", [])
+            
+            matches.append((track_id, similarity_score, payload))
+            
+            print(f"\n🎯 Match #{idx}")
+            print(f"   Track ID: {track_id}")
+            print(f"   Similarity Score: {similarity_score:.4f} (higher = better match)")
+            print(f"   Video ID: {video_id_result}")
+            print(f"   Time Range: {start_time}s → {end_time}s")
+            print(f"   Duration: {num_frames} frames")
+            print(f"   Verified: {'✓ YES' if verified else '✗ NO'}")
+            
+            # Display clothing colors
+            upper_color = payload.get("upper_color")
+            lower_color = payload.get("lower_color")
+            if upper_color or lower_color:
+                color_info = []
+                if upper_color:
+                    color_info.append(f"upper={upper_color}")
+                if lower_color:
+                    color_info.append(f"lower={lower_color}")
+                print(f"   Clothing: {', '.join(color_info)}")
+            
+            # Display attributes
+            attributes = payload.get("attributes", {})
+            detected_attrs = []
+            if attributes.get("has_hat"):
+                detected_attrs.append("Hat")
+            if attributes.get("has_hood"):
+                detected_attrs.append("Hood")
+            if attributes.get("has_glasses"):
+                detected_attrs.append("Glasses")
+            
+            if detected_attrs:
+                print(f"   Attributes: {', '.join(detected_attrs)}")
+            
+            if carried_objs:
+                print(f"   Objects: {', '.join(carried_objs)}")
+        
+        print(f"\n{'='*80}\n")
+        
+        return matches
+        
+    except Exception as e:
+        print(f"❌ Error during post-processing face comparison: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+# ========================
 # Interactive Query Loop
 # ========================
 # print("\n" + "🎤"*40)
@@ -6533,3 +6770,100 @@ def query_tracklets_by_text(text_prompt, top_k=5):
 print("\n" + "="*80)
 print("🏁 Pipeline and query session complete!")
 print("="*80)
+# ===== POST-PROCESSING FACE COMPARISON (if image provided) =====
+# If a reference face image path is provided via environment variable, run comparison now
+REFERENCE_FACE_IMAGE = os.environ.get("REFERENCE_FACE_IMAGE", None)
+print(f"\n[DEBUG] REALTIME_FACE_COMPARISON: {REALTIME_FACE_COMPARISON}")
+print(f"[DEBUG] REFERENCE_FACE_IMAGE env var: {REFERENCE_FACE_IMAGE}")
+
+if REFERENCE_FACE_IMAGE and not REALTIME_FACE_COMPARISON:
+    print("\n" + "="*80)
+    print("🔍 RUNNING POST-PROCESSING FACE COMPARISON")
+    print("="*80)
+    print(f"Reference image path: {REFERENCE_FACE_IMAGE}")
+    print(f"Video ID filter: {VIDEO_ID}")
+    
+    if os.path.exists(REFERENCE_FACE_IMAGE):
+        try:
+            # Check if Qdrant client is available
+            if not client:
+                print("❌ Error: Qdrant client not initialized. Cannot perform face comparison.")
+            else:
+                print("✓ Qdrant client is available")
+                
+                # Check if person_tracks collection exists
+                try:
+                    collections = client.get_collections()
+                    collection_names = [c.name for c in collections.collections]
+                    print(f"✓ Available collections: {collection_names}")
+                    
+                    if "person_tracks" not in collection_names:
+                        print("❌ Error: person_tracks collection not found in Qdrant")
+                    else:
+                        print("✓ person_tracks collection exists")
+                        
+                        # Count points in collection
+                        count_result = client.count("person_tracks")
+                        print(f"✓ Total points in person_tracks: {count_result.count}")
+                        
+                        # Now run the comparison
+                        matches = compare_face_after_processing(
+                            reference_image_path=REFERENCE_FACE_IMAGE,
+                            video_id=VIDEO_ID,
+                            top_k=10
+                        )
+                        
+                        if matches:
+                            print("\n" + "="*80)
+                            print("✅ FACE COMPARISON RESULTS")
+                            print("="*80)
+                            for idx, (track_id, sim_score, payload) in enumerate(matches, 1):
+                                print(f"\n#{idx}: Person Track {track_id}")
+                                print(f"     Similarity: {sim_score:.4f} ({sim_score*100:.2f}%)")
+                                print(f"     Time: {payload.get('start_time')}s - {payload.get('end_time')}s")
+                                print(f"     Duration: {payload.get('num_frames')} frames")
+                                
+                                upper = payload.get('upper_color')
+                                lower = payload.get('lower_color')
+                                if upper or lower:
+                                    print(f"     Clothing: {upper or 'N/A'} (upper), {lower or 'N/A'} (lower)")
+                                
+                                attrs = payload.get('attributes', {})
+                                attr_list = []
+                                if attrs.get('has_hat'): attr_list.append('Hat')
+                                if attrs.get('has_hood'): attr_list.append('Hood')
+                                if attrs.get('has_glasses'): attr_list.append('Glasses')
+                                if attr_list:
+                                    print(f"     Attributes: {', '.join(attr_list)}")
+                                
+                                objs = payload.get('object_carried', [])
+                                if objs:
+                                    print(f"     Carrying: {', '.join(objs)}")
+                            print("="*80)
+                        else:
+                            print("\n⚠ No matches found in Qdrant for the given reference face.")
+                            print("This could mean:")
+                            print("  1. No face embeddings were stored in Qdrant")
+                            print("  2. The reference face doesn't match any detected faces")
+                            print("  3. Try with a different reference image")
+                            
+                except Exception as e:
+                    print(f"❌ Error checking Qdrant collections: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    
+        except Exception as e:
+            print(f"\n❌ Error during post-processing comparison: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"\n❌ Reference face image not found: {REFERENCE_FACE_IMAGE}")
+        print(f"   Current working directory: {os.getcwd()}")
+        print(f"   Please provide full path to the image or place it in: {os.getcwd()}")
+elif REFERENCE_FACE_IMAGE and REALTIME_FACE_COMPARISON:
+    print("\n⚠ REFERENCE_FACE_IMAGE provided but REALTIME_FACE_COMPARISON is enabled.")
+    print("   Post-processing comparison requires REALTIME_FACE_COMPARISON=false")
+else:
+    print("\n[INFO] No reference face image provided via REFERENCE_FACE_IMAGE env var.")
+    print("       To run post-processing face comparison, set:")
+    print("       export REFERENCE_FACE_IMAGE=/path/to/face.jpg")
