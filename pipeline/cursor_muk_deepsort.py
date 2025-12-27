@@ -3594,7 +3594,7 @@ except Exception:
 # ===== FACE COMPARISON MODE =====
 # Set to True for real-time face comparison during video processing (legacy mode)
 # Set to False for post-processing face comparison after video is complete
-REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "false").lower() == "false"
+REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "false").lower() == "true"
 print(f"Face comparison mode: {'REAL-TIME' if REALTIME_FACE_COMPARISON else 'POST-PROCESSING'}")
 REF_FACE_PATHS = ["sabbas.jpg"]
 
