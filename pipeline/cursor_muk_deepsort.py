@@ -3481,11 +3481,11 @@ except Exception as e:
     print("Failed to connect to Qdrant:", e)
 
 try:
-    # create_qdrant_schema is defined in qdrant_collections.py; call it qualified
-    qdrant_collections.create_qdrant_schema(client)
-    print("Qdrant schema created successfully.")
+    # NOTE: Mode will be set later after REALTIME_FACE_COMPARISON is defined
+    # For now, store client for later initialization
+    pass
 except Exception as e:
-    print("Failed to create Qdrant schema:", e)
+    print("Failed to initialize Qdrant:", e)
 
 # InsightFace
 try:
@@ -3596,6 +3596,18 @@ except Exception:
 # Set to False for post-processing face comparison after video is complete
 REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "false").lower() == "true"
 print(f"Face comparison mode: {'REAL-TIME' if REALTIME_FACE_COMPARISON else 'POST-PROCESSING'}")
+
+# Initialize Qdrant schema based on mode (after REALTIME_FACE_COMPARISON is defined)
+try:
+    qdrant_collections.create_qdrant_schema(client, realtime_mode=REALTIME_FACE_COMPARISON)
+    if REALTIME_FACE_COMPARISON:
+        print("✅ Qdrant schema initialized for REAL-TIME mode")
+    else:
+        print("✅ Qdrant schema validated for POST-PROCESSING mode")
+except Exception as e:
+    print(f"❌ Failed to initialize Qdrant schema: {e}")
+    sys.exit(1)
+
 REF_FACE_PATHS = ["sabbas.jpg"]
 
 YOLO_PERSON_MODEL = "yolov8m.pt"        # your person model
@@ -4481,26 +4493,26 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
         face_vec = face_avg.tolist() if isinstance(face_avg, np.ndarray) else list(face_avg)
         reid_vec = reid_avg.tolist() if isinstance(reid_avg, np.ndarray) else list(reid_avg)
         
-        # multi_vec: prefer CLIP embedding, fallback to face embedding padded to 768
+        # multi_vec: prefer CLIP embedding, fallback to face embedding (both 512D now)
         clip_avg = tracklet.avg_clip()
 
-        def pad_to_768(vec):
-            """Pad vector to 768D by appending zeros."""
+        def pad_to_512(vec):
+            """Pad vector to 512D by appending zeros."""
             vec_list = vec.tolist() if isinstance(vec, np.ndarray) else list(vec)
-            if len(vec_list) >= 768:
-                return vec_list[:768]
-            return vec_list + [0.0] * (768 - len(vec_list))
+            if len(vec_list) >= 512:
+                return vec_list[:512]
+            return vec_list + [0.0] * (512 - len(vec_list))
         
         if clip_avg is not None:
-            multi_vec = pad_to_768(clip_avg)
+            multi_vec = pad_to_512(clip_avg)
         else:
-            multi_vec = pad_to_768(face_avg)
+            multi_vec = pad_to_512(face_avg)
         
-        # Build vectors dict for NamedVectors (per spec: face_vec 512D, reid_vec 512D, multi_vec 768D)
+        # Build vectors dict for NamedVectors (per spec: all 512D - InsightFace, TorchReID, CLIP ViT-B/32)
         vectors = {
             "face_vec": face_vec,          # 512D (InsightFace)
             "reid_vec": reid_vec,          # 512D (TorchReID)
-            "multi_vec": multi_vec,        # 768D (CLIP or padded face_vec)
+            "multi_vec": multi_vec,        # 512D (CLIP ViT-B/32 or padded face_vec)
         }
         
         # Insert to Qdrant (quiet success)
@@ -4583,20 +4595,20 @@ def insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None
         # Use averaged CLIP embeddings if available, otherwise zeros
         avg_clip_emb = obj_track.avg_clip()
         if avg_clip_emb is not None:
-            # Pad to 768D if needed
-            if len(avg_clip_emb) < 768:
-                object_vec = np.concatenate([avg_clip_emb, np.zeros(768 - len(avg_clip_emb), dtype=np.float32)]).tolist()
+            # CLIP ViT-B/32 outputs 512D - no padding needed
+            if len(avg_clip_emb) < 512:
+                object_vec = np.concatenate([avg_clip_emb, np.zeros(512 - len(avg_clip_emb), dtype=np.float32)]).tolist()
             else:
-                object_vec = avg_clip_emb[:768].tolist()
+                object_vec = avg_clip_emb[:512].tolist()
             multi_vec = object_vec  # Use same embedding for multi_vec
         else:
             # Fallback to zeros if no CLIP embeddings collected
-            object_vec = np.zeros(768, dtype=np.float32).tolist()
-            multi_vec = np.zeros(768, dtype=np.float32).tolist()
+            object_vec = np.zeros(512, dtype=np.float32).tolist()
+            multi_vec = np.zeros(512, dtype=np.float32).tolist()
         
         vectors = {
-            "object_vec": object_vec,  # 768D (placeholder for future CLIP embeddings)
-            "multi_vec": multi_vec,     # 768D (placeholder)
+            "object_vec": object_vec,  # 512D (CLIP ViT-B/32)
+            "multi_vec": multi_vec,     # 512D (CLIP ViT-B/32)
         }
         
         # Insert into Qdrant
@@ -6013,11 +6025,11 @@ def query_objects_by_text(text_prompt, top_k=5):
                 text_emb = clip_model.encode_text(text_token).cpu().numpy().flatten()
                 text_emb = text_emb / (np.linalg.norm(text_emb) + 1e-8)  # Normalize
             
-            # Pad to 768D if needed
-            if len(text_emb) < 768:
-                text_vec = np.concatenate([text_emb, np.zeros(768 - len(text_emb), dtype=np.float32)])
+            # CLIP ViT-B/32 outputs 512D - no padding needed
+            if len(text_emb) < 512:
+                text_vec = np.concatenate([text_emb, np.zeros(512 - len(text_emb), dtype=np.float32)])
             else:
-                text_vec = text_emb[:768]
+                text_vec = text_emb[:512]
             
             # Scroll all objects and compute similarities manually
             points, _ = client.scroll(
@@ -6269,11 +6281,11 @@ def query_tracklets_by_text(text_prompt, top_k=5):
             text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + 1e-8)
             text_embedding = text_features.squeeze().cpu().numpy().astype(np.float32)
 
-        # Pad to 768D (same as multi_vec in Qdrant)
-        if len(text_embedding) < 768:
-            text_embedding = np.concatenate([text_embedding, np.zeros(768 - len(text_embedding), dtype=np.float32)])
+        # CLIP ViT-B/32 outputs 512D (same as multi_vec in Qdrant)
+        if len(text_embedding) < 512:
+            text_embedding = np.concatenate([text_embedding, np.zeros(512 - len(text_embedding), dtype=np.float32)])
         else:
-            text_embedding = text_embedding[:768]
+            text_embedding = text_embedding[:512]
 
         print(f"   Text embedding generated: {len(text_embedding)}D")
 
