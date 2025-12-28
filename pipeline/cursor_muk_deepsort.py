@@ -3432,6 +3432,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, NamedVector, PointStruct
 from dotenv import load_dotenv
 import os
+import sys
 import qdrant_collections  # for collection constants
 from PIL import Image
 import uuid
@@ -3592,14 +3593,18 @@ except Exception:
     VIDEO_ID = 1
 
 # ===== FACE COMPARISON MODE =====
-# Set to True for real-time face comparison during video processing (legacy mode)
-# Set to False for post-processing face comparison after video is complete
+# Set to True for real-time face comparison during video processing (creates collections)
+# Set to False for post-processing face comparison after video is complete (validates collections exist)
+# Default: True (REAL-TIME) - collections are created on first run
 REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "false").lower() == "true"
 print(f"Face comparison mode: {'REAL-TIME' if REALTIME_FACE_COMPARISON else 'POST-PROCESSING'}")
 
 # Initialize Qdrant schema based on mode (after REALTIME_FACE_COMPARISON is defined)
 try:
-    qdrant_collections.create_qdrant_schema(client, realtime_mode=REALTIME_FACE_COMPARISON)
+    schema_ok = qdrant_collections.create_qdrant_schema(client, realtime_mode=REALTIME_FACE_COMPARISON)
+    if not schema_ok:
+        print("❌ Qdrant schema validation failed. In POST-PROCESSING mode, run first with REALTIME_FACE_COMPARISON=true")
+        sys.exit(1)
     if REALTIME_FACE_COMPARISON:
         print("✅ Qdrant schema initialized for REAL-TIME mode")
     else:
@@ -4423,6 +4428,12 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
     Returns:
         bool: True if insertion succeeded, False otherwise
     """
+    # Skip inserts in POST-PROCESSING mode
+    try:
+        if not REALTIME_FACE_COMPARISON:
+            return False
+    except NameError:
+        pass
     if not client:
         return False
     
@@ -4551,6 +4562,12 @@ def insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None
     Returns:
         bool: True if insertion succeeded, False otherwise
     """
+    # Skip inserts in POST-PROCESSING mode
+    try:
+        if not REALTIME_FACE_COMPARISON:
+            return False
+    except NameError:
+        pass
     if not client:
         return False
     
@@ -4895,7 +4912,7 @@ print(f"🔍 Qdrant client status: {'Connected' if client else 'Not connected (N
 # small helper to map face boxes per frame
 face_boxes_frame = []
 
-while True:
+while REALTIME_FACE_COMPARISON:
     ret, frame = cap.read()
     if not ret:
         break
@@ -5965,27 +5982,28 @@ while True:
         break
 
 # After loop ends, insert any remaining tracklets (verified and unverified) that were not inserted yet
-for tid, t in list(tracklets.items()):
-    if not t.inserted and client:
-        t.inserted = insert_tracklet_to_qdrant(client, t, video_id=1, segment_id=None, frame_rate=30.0)
+if REALTIME_FACE_COMPARISON:
+    for tid, t in list(tracklets.items()):
+        if not t.inserted and client:
+            t.inserted = insert_tracklet_to_qdrant(client, t, video_id=1, segment_id=None, frame_rate=30.0)
 
-# Also insert any remaining object tracklets
-for oid, obj_track in list(object_tracklets.items()):
-    if not obj_track.inserted and client:
-        obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None, frame_rate=30.0)
+    # Also insert any remaining object tracklets
+    for oid, obj_track in list(object_tracklets.items()):
+        if not obj_track.inserted and client:
+            obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None, frame_rate=30.0)
 
-cap.release()
-cv2.destroyAllWindows()
+    cap.release()
+    cv2.destroyAllWindows()
 
-# ========================
-# POST-PROCESSING: Interactive Query Feature
-# ========================
-print("\n" + "="*80)
-print("🎬 VIDEO PROCESSING COMPLETE!")
-print("="*80)
-print(f"Total tracklets processed: {len(tracklets)}")
-print(f"Verified tracklets: {sum(1 for t in tracklets.values() if t.verified)}")
-print("="*80 + "\n")
+    # ========================
+    # POST-PROCESSING: Interactive Query Feature
+    # ========================
+    print("\n" + "="*80)
+    print("🎬 VIDEO PROCESSING COMPLETE!")
+    print("="*80)
+    print(f"Total tracklets processed: {len(tracklets)}")
+    print(f"Verified tracklets: {sum(1 for t in tracklets.values() if t.verified)}")
+    print("="*80 + "\n")
 
 def query_objects_by_text(text_prompt, top_k=5):
     """

@@ -197,6 +197,8 @@ def create_qdrant_schema(client: QdrantClient, realtime_mode: bool = True):
         print(f"✅ Indexes ready for {OBJECT_TRACKS_COLLECTION}")
     except Exception as e:
         print(f"⚠ Error with object_tracks indexes: {e}")
+    
+    return True
 
 
 # if __name__ == "__main__":
