@@ -3594,9 +3594,24 @@ except Exception:
 # ===== FACE COMPARISON MODE =====
 # Set to True for real-time face comparison during video processing (legacy mode)
 # Set to False for post-processing face comparison after video is complete
-REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "false").lower() == "true"
+REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "false").lower() == "false"
 print(f"Face comparison mode: {'REAL-TIME' if REALTIME_FACE_COMPARISON else 'POST-PROCESSING'}")
-REF_FACE_PATHS = ["sabbas.jpg"]
+
+# Use REFERENCE_FACE_IMAGE env var if provided, otherwise use default
+REFERENCE_FACE_IMAGE = os.environ.get("REFERENCE_FACE_IMAGE", None)
+if REFERENCE_FACE_IMAGE:
+    REF_FACE_PATHS = [REFERENCE_FACE_IMAGE]
+    print(f"[CONFIG] Using reference image from env: {REFERENCE_FACE_IMAGE}")
+else:
+    REF_FACE_PATHS = []  # Empty list if no reference image provided
+    print("[CONFIG] No reference image provided")
+
+# Text query for semantic search
+TEXT_QUERY = os.environ.get("TEXT_QUERY", None)
+if TEXT_QUERY:
+    print(f"[CONFIG] Text query provided: {TEXT_QUERY}")
+else:
+    print("[CONFIG] No text query provided")
 
 YOLO_PERSON_MODEL = "yolov8m.pt"        # your person model
 YOLO_FACE_MODEL = "yolov8m-face.pt"     # recommended: yolov8n-face or yolov8m-face
@@ -4083,7 +4098,7 @@ def normalize(v):
     v = v.astype(np.float32)
     return v / (np.linalg.norm(v)+1e-8)
 
-if REALTIME_FACE_COMPARISON:
+if REALTIME_FACE_COMPARISON and REF_FACE_PATHS:
     # REAL-TIME MODE: Load reference face embeddings for comparison during processing
     print("\n" + "="*80)
     print("🔴 REAL-TIME FACE COMPARISON MODE")
@@ -6770,11 +6785,15 @@ def compare_face_after_processing(reference_image_path, video_id=None, top_k=10)
 print("\n" + "="*80)
 print("🏁 Pipeline and query session complete!")
 print("="*80)
-# ===== POST-PROCESSING FACE COMPARISON (if image provided) =====
-# If a reference face image path is provided via environment variable, run comparison now
+
+# ===== POST-PROCESSING FACE COMPARISON or TEXT SEARCH =====
+# If a reference face image path is provided via environment variable, run face comparison
+# If a text query is provided via environment variable, run semantic search
 REFERENCE_FACE_IMAGE = os.environ.get("REFERENCE_FACE_IMAGE", None)
+TEXT_QUERY = os.environ.get("TEXT_QUERY", None)
 print(f"\n[DEBUG] REALTIME_FACE_COMPARISON: {REALTIME_FACE_COMPARISON}")
 print(f"[DEBUG] REFERENCE_FACE_IMAGE env var: {REFERENCE_FACE_IMAGE}")
+print(f"[DEBUG] TEXT_QUERY env var: {TEXT_QUERY}")
 
 if REFERENCE_FACE_IMAGE and not REALTIME_FACE_COMPARISON:
     print("\n" + "="*80)
@@ -6860,6 +6879,70 @@ if REFERENCE_FACE_IMAGE and not REALTIME_FACE_COMPARISON:
         print(f"\n❌ Reference face image not found: {REFERENCE_FACE_IMAGE}")
         print(f"   Current working directory: {os.getcwd()}")
         print(f"   Please provide full path to the image or place it in: {os.getcwd()}")
+
+elif TEXT_QUERY and not REALTIME_FACE_COMPARISON:
+    print("\n" + "="*80)
+    print("🔍 RUNNING TEXT-BASED SEMANTIC SEARCH")
+    print("="*80)
+    print(f"Text query: '{TEXT_QUERY}'")
+    print(f"Video ID filter: {VIDEO_ID}")
+    
+    try:
+        # Check if Qdrant client is available
+        if not client:
+            print("❌ Error: Qdrant client not initialized. Cannot perform text search.")
+        else:
+            print("✓ Qdrant client is available")
+            
+            # Check if CLIP is available
+            if not USE_CLIP:
+                print("❌ Error: CLIP model not loaded. Cannot perform text-based search.")
+                print("   Please install the 'clip' package: pip install clip-torch")
+            else:
+                print("✓ CLIP model is available")
+                
+                # Run text-based search
+                matches = query_tracklets_by_text(TEXT_QUERY, top_k=10)
+                
+                if matches:
+                    print("\n" + "="*80)
+                    print("✅ TEXT SEARCH RESULTS")
+                    print("="*80)
+                    for idx, (track_id, sim_score, payload) in enumerate(matches, 1):
+                        print(f"\n#{idx}: Person Track {track_id}")
+                        print(f"     Relevance Score: {sim_score:.4f} ({sim_score*100:.2f}%)")
+                        print(f"     Time: {payload.get('start_time')}s - {payload.get('end_time')}s")
+                        print(f"     Duration: {payload.get('num_frames')} frames")
+                        
+                        upper = payload.get('upper_color')
+                        lower = payload.get('lower_color')
+                        if upper or lower:
+                            print(f"     Clothing: {upper or 'N/A'} (upper), {lower or 'N/A'} (lower)")
+                        
+                        attrs = payload.get('attributes', {})
+                        attr_list = []
+                        if attrs.get('has_hat'): attr_list.append('Hat')
+                        if attrs.get('has_hood'): attr_list.append('Hood')
+                        if attrs.get('has_glasses'): attr_list.append('Glasses')
+                        if attr_list:
+                            print(f"     Attributes: {', '.join(attr_list)}")
+                        
+                        objs = payload.get('object_carried', [])
+                        if objs:
+                            print(f"     Carrying: {', '.join(objs)}")
+                    print("="*80)
+                else:
+                    print("\n⚠ No matches found in Qdrant for the given text query.")
+                    print("This could mean:")
+                    print("  1. No tracklets were stored in Qdrant")
+                    print("  2. The query doesn't match any detected people/objects")
+                    print("  3. Try with different keywords")
+                    
+    except Exception as e:
+        print(f"\n❌ Error during text-based search: {e}")
+        import traceback
+        traceback.print_exc()
+
 elif REFERENCE_FACE_IMAGE and REALTIME_FACE_COMPARISON:
     print("\n⚠ REFERENCE_FACE_IMAGE provided but REALTIME_FACE_COMPARISON is enabled.")
     print("   Post-processing comparison requires REALTIME_FACE_COMPARISON=false")
