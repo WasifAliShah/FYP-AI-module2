@@ -17,10 +17,13 @@ from temporalio.common import RetryPolicy
 with workflow.unsafe.imports_passed_through():
     from activities import (
         download_video_activity,
+        download_reference_image_activity,
         process_video_activity,
         store_results_activity,
         update_video_status_activity,
     )
+    # Import module to access symbols not reliably imported by name in sandbox
+    import activities as activities_module
 
 
 @workflow.defn
@@ -66,6 +69,10 @@ class VideoProcessingWorkflow:
             maximum_attempts=3,
         )
         
+        # Track paths for cleanup in both success and failure cases
+        download_result = None
+        image_result = None
+
         try:
             # =========================================================================
             # Step 1: Download Video from S3
@@ -82,13 +89,58 @@ class VideoProcessingWorkflow:
             workflow.logger.info(f"✅ Download complete: {download_result['local_path']}")
             
             # =========================================================================
+            # Step 1b: Download Reference Image from S3 (if associated with video)
+            # =========================================================================
+            workflow.logger.info(f"📥 Step 1b: Checking for associated reference image")
+            
+            # Note: In a real scenario, you would query the database here to get image_data
+            # For now, this is optional and can be passed in video_data if available
+            image_data = video_data.get('image_data', None)
+            
+            image_result = None
+            if image_data:
+                image_result = await workflow.execute_activity(
+                    download_reference_image_activity,
+                    image_data,
+                    start_to_close_timeout=timedelta(minutes=5),  # 5 min for image download
+                    retry_policy=RetryPolicy(
+                        initial_interval=timedelta(seconds=1),
+                        maximum_interval=timedelta(seconds=30),
+                        backoff_coefficient=2.0,
+                        maximum_attempts=2,
+                    ),
+                )
+                
+                if image_result.get('status') == 'downloaded':
+                    workflow.logger.info(f"✅ Reference image downloaded: {image_result['local_path']}")
+                else:
+                    workflow.logger.info(f"⚠ No reference image to download (status: {image_result.get('status')})")
+            else:
+                workflow.logger.info(f"⚠ No reference image data provided")
+            
+            # =========================================================================
             # Step 2: Process Video with ML Pipeline
             # =========================================================================
             workflow.logger.info(f"🎬 Step 2: Processing video with ML pipeline")
             
+            # Either image or text query must be provided
+            has_image = image_result and image_result.get('status') == 'downloaded'
+            text_query = video_data.get('text_query', None)
+            
+            if not has_image and not text_query:
+                workflow.logger.error(f"⚠ Neither image nor text query provided")
+                raise RuntimeError("Either reference image or text query must be provided")
+            
+            # Combine download and results into a single argument dict
+            process_input = {
+                "download_result": download_result,
+                "image_result": image_result if has_image else None,
+                "text_query": text_query
+            }
+            
             processing_result = await workflow.execute_activity(
                 process_video_activity,
-                download_result,
+                process_input,
                 start_to_close_timeout=timedelta(hours=2),  # 2 hours for processing
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(seconds=5),
@@ -129,6 +181,28 @@ class VideoProcessingWorkflow:
                 retry_policy=retry_policy,
             )
             
+            # =========================================================================
+            # Step 5: Cleanup local files (best effort)
+            # =========================================================================
+            try:
+                await workflow.execute_activity(
+                    activities_module.cleanup_files_activity,
+                    {
+                        "video_path": download_result.get("local_path") if download_result else None,
+                        "image_path": image_result.get("local_path") if (image_result and image_result.get("status") == "downloaded") else None,
+                    },
+                    start_to_close_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(
+                        initial_interval=timedelta(seconds=1),
+                        maximum_interval=timedelta(seconds=10),
+                        backoff_coefficient=2.0,
+                        maximum_attempts=2,
+                    ),
+                )
+                workflow.logger.info("🧹 Cleanup complete for local downloaded files")
+            except Exception as ce:
+                workflow.logger.warning(f"⚠ Cleanup failed: {ce}")
+
             workflow.logger.info(f"🎉 Workflow completed successfully for video_id: {video_id}")
             
             return final_result
@@ -136,6 +210,25 @@ class VideoProcessingWorkflow:
         except Exception as e:
             # Log error and return failure result
             workflow.logger.error(f"❌ Workflow failed for video_id: {video_id}: {e}")
+            # Best-effort cleanup even on failures
+            try:
+                await workflow.execute_activity(
+                    activities_module.cleanup_files_activity,
+                    {
+                        "video_path": download_result.get("local_path") if download_result else None,
+                        "image_path": image_result.get("local_path") if (image_result and image_result.get("status") == "downloaded") else None,
+                    },
+                    start_to_close_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(
+                        initial_interval=timedelta(seconds=1),
+                        maximum_interval=timedelta(seconds=10),
+                        backoff_coefficient=2.0,
+                        maximum_attempts=2,
+                    ),
+                )
+                workflow.logger.info("🧹 Cleanup attempted after failure")
+            except Exception as ce:
+                workflow.logger.warning(f"⚠ Cleanup after failure also failed: {ce}")
             
             # Return error result
             return {

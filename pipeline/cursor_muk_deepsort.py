@@ -176,9 +176,7 @@ except Exception:
     VIDEO_ID = 1
 
 # ===== FACE COMPARISON MODE =====
-# Set to True for real-time face comparison during video processing (legacy mode)
-# Set to False for post-processing face comparison after video is complete
-REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "true").lower() == "true"
+REALTIME_FACE_COMPARISON = os.environ.get("REALTIME_FACE_COMPARISON", "false").lower() == "false"
 print(f"Face comparison mode: {'REAL-TIME' if REALTIME_FACE_COMPARISON else 'POST-PROCESSING'}")
 
 # Initialize / validate Qdrant schema based on mode
@@ -714,7 +712,15 @@ if REALTIME_FACE_COMPARISON and REF_FACE_PATHS:
     print("Loading reference face images for real-time verification...")
     
     for path in REF_FACE_PATHS:
-        img = cv2.imread(path)
+        # Be robust to missing files (ultralytics patches imread to raise on missing)
+        if not os.path.exists(path):
+            print(f"Warning: reference image path does not exist: {path}")
+            continue
+        try:
+            img = cv2.imread(path)
+        except Exception as e:
+            print(f"Warning: could not load reference image {path}: {e}")
+            continue
         if img is None:
             print("Warning: could not load reference image", path)
             continue
@@ -2787,15 +2793,14 @@ while REALTIME_FACE_COMPARISON:
         break
 
 # After loop ends, insert any remaining tracklets (verified and unverified) that were not inserted yet
-if REALTIME_FACE_COMPARISON:
-    for tid, t in list(tracklets.items()):
-        if not t.inserted and client:
-            t.inserted = insert_tracklet_to_qdrant(client, t, video_id=1, segment_id=None, frame_rate=30.0)
+for tid, t in list(tracklets.items()):
+    if not t.inserted and client:
+        t.inserted = insert_tracklet_to_qdrant(client, t, video_id=VIDEO_ID, segment_id=None, frame_rate=30.0)
 
-    # Also insert any remaining object tracklets
-    for oid, obj_track in list(object_tracklets.items()):
-        if not obj_track.inserted and client:
-            obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=1, segment_id=None, frame_rate=30.0)
+# Also insert any remaining object tracklets
+for oid, obj_track in list(object_tracklets.items()):
+    if not obj_track.inserted and client:
+        obj_track.inserted = insert_object_track_to_qdrant(client, obj_track, video_id=VIDEO_ID, segment_id=None, frame_rate=30.0)
 
     cap.release()
     cv2.destroyAllWindows()
@@ -3081,10 +3086,15 @@ def query_objects_by_text(text_prompt, top_k=5):
         traceback.print_exc()
         return []
 
-def query_tracklets_by_text(text_prompt, top_k=5):
+def query_tracklets_by_text(text_prompt, top_k=5, video_id=None):
     """
     Query Qdrant for tracklets matching a text description using CLIP embeddings.
     This uses scroll with vectors to stay compatible with older client versions.
+    
+    Args:
+        text_prompt: Text description to search for
+        top_k: Number of top results to return
+        video_id: Filter results to specific video_id (if provided)
     """
     if not USE_CLIP or clip_model is None:
         print("❌ CLIP not available - cannot perform text-based search")
@@ -3096,6 +3106,8 @@ def query_tracklets_by_text(text_prompt, top_k=5):
 
     try:
         print(f"\n🔍 Searching for: '{text_prompt}'")
+        if video_id:
+            print(f"   Filtering by video_id: {video_id}")
         print("   Encoding text prompt with CLIP...")
 
         with torch.no_grad():
@@ -3113,18 +3125,34 @@ def query_tracklets_by_text(text_prompt, top_k=5):
         print(f"   Text embedding generated: {len(text_embedding)}D")
 
         # Scroll all points with vectors and payloads
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        
+        scroll_filter = None
+        if video_id is not None:
+            scroll_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="video_id",
+                        match=MatchValue(value=video_id)
+                    )
+                ]
+            )
+
         points, _ = client.scroll(
             collection_name="person_tracks",
             limit=1000,
             with_payload=True,
             with_vectors=True,
+            scroll_filter=scroll_filter
         )
 
         if not points:
             print("   ⚠ No points found in collection")
             return []
 
-        similarities = []
+        # Use dict to deduplicate by track_id (keep best score per track)
+        track_similarities = {}
+        
         for p in points:
             if not hasattr(p, "vector") or p.vector is None:
                 continue
@@ -3151,6 +3179,7 @@ def query_tracklets_by_text(text_prompt, top_k=5):
             # Apply smart boosting based on query keywords and metadata
             boosted_score = sim
             payload = p.payload if hasattr(p, "payload") else {}
+            track_id = payload.get("track_id", "Unknown")
             carried_objs = payload.get("object_carried", [])
             verified = payload.get("verified", False)
             
@@ -3232,12 +3261,16 @@ def query_tracklets_by_text(text_prompt, top_k=5):
             if "verified" in query_lower and verified:
                 boosted_score += 0.03
             
-            similarities.append((boosted_score, p))
+            # Deduplicate by track_id: keep highest score
+            if track_id not in track_similarities or boosted_score > track_similarities[track_id][0]:
+                track_similarities[track_id] = (boosted_score, p)
 
-        if not similarities:
+        if not track_similarities:
             print("   ⚠ No valid vectors to compare")
             return []
 
+        # Convert dict to list for sorting
+        similarities = list(track_similarities.values())
         similarities.sort(key=lambda x: x[0], reverse=True)
         top_results = similarities[:top_k]
 
@@ -3615,7 +3648,73 @@ print(f"\n[DEBUG] REALTIME_FACE_COMPARISON: {REALTIME_FACE_COMPARISON}")
 print(f"[DEBUG] REFERENCE_FACE_IMAGE env var: {REFERENCE_FACE_IMAGE}")
 print(f"[DEBUG] TEXT_QUERY env var: {TEXT_QUERY}")
 
-if REFERENCE_FACE_IMAGE and not REALTIME_FACE_COMPARISON:
+# Initialize matches at the top so it's available for all cases
+matches = []
+
+# ===== CASE 1: REAL-TIME INGEST + TEXT QUERY (ingest video first, then search) =====
+if REALTIME_FACE_COMPARISON and TEXT_QUERY:
+    print("\n" + "="*80)
+    print("⚙️ REAL-TIME INGEST + TEXT QUERY")
+    print("="*80)
+    print(f"Video ingested with TEXT_QUERY: '{TEXT_QUERY}'")
+    print(f"Video ID: {VIDEO_ID}")
+    
+    try:
+        if not client:
+            print("❌ Error: Qdrant client not initialized. Cannot perform text search.")
+        else:
+            print("✓ Qdrant client is available")
+            
+            if not USE_CLIP:
+                print("❌ Error: CLIP model not loaded. Cannot perform text-based search.")
+                print("   Please install the 'clip' package: pip install clip-torch")
+            else:
+                print("✓ CLIP model is available")
+                
+                # Run text-based search on the freshly ingested data
+                matches = query_tracklets_by_text(TEXT_QUERY, top_k=10, video_id=VIDEO_ID)
+                
+                if matches:
+                    print("\n" + "="*80)
+                    print("✅ TEXT SEARCH RESULTS (from freshly ingested video)")
+                    print("="*80)
+                    for idx, (track_id, sim_score, payload) in enumerate(matches, 1):
+                        print(f"\n#{idx}: Person Track {track_id}")
+                        print(f"     Relevance Score: {sim_score:.4f} ({sim_score*100:.2f}%)")
+                        print(f"     Time: {payload.get('start_time')}s - {payload.get('end_time')}s")
+                        print(f"     Duration: {payload.get('num_frames')} frames")
+                        
+                        upper = payload.get('upper_color')
+                        lower = payload.get('lower_color')
+                        if upper or lower:
+                            print(f"     Clothing: {upper or 'N/A'} (upper), {lower or 'N/A'} (lower)")
+                        
+                        attrs = payload.get('attributes', {})
+                        attr_list = []
+                        if attrs.get('has_hat'): attr_list.append('Hat')
+                        if attrs.get('has_hood'): attr_list.append('Hood')
+                        if attrs.get('has_glasses'): attr_list.append('Glasses')
+                        if attr_list:
+                            print(f"     Attributes: {', '.join(attr_list)}")
+                        
+                        objs = payload.get('object_carried', [])
+                        if objs:
+                            print(f"     Carrying: {', '.join(objs)}")
+                    print("="*80)
+                else:
+                    print("\n⚠ No matches found in Qdrant for the given text query.")
+                    print("This could mean:")
+                    print("  1. No tracklets were detected in the video")
+                    print("  2. The query doesn't match any detected people/objects")
+                    print("  3. Try with different keywords")
+                    
+    except Exception as e:
+        print(f"\n❌ Error during text search: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ===== CASE 2: POST-PROCESSING FACE COMPARISON (image query on existing data) =====
+elif REFERENCE_FACE_IMAGE and not REALTIME_FACE_COMPARISON:
     print("\n" + "="*80)
     print("🔍 RUNNING POST-PROCESSING FACE COMPARISON")
     print("="*80)
@@ -3702,7 +3801,7 @@ if REFERENCE_FACE_IMAGE and not REALTIME_FACE_COMPARISON:
 
 elif TEXT_QUERY and not REALTIME_FACE_COMPARISON:
     print("\n" + "="*80)
-    print("🔍 RUNNING TEXT-BASED SEMANTIC SEARCH")
+    print("🔍 CASE 3: POST-PROCESSING TEXT QUERY (query existing data only)")
     print("="*80)
     print(f"Text query: '{TEXT_QUERY}'")
     print(f"Video ID filter: {VIDEO_ID}")
@@ -3722,7 +3821,7 @@ elif TEXT_QUERY and not REALTIME_FACE_COMPARISON:
                 print("✓ CLIP model is available")
                 
                 # Run text-based search
-                matches = query_tracklets_by_text(TEXT_QUERY, top_k=10)
+                matches = query_tracklets_by_text(TEXT_QUERY, top_k=10, video_id=VIDEO_ID)
                 
                 if matches:
                     print("\n" + "="*80)
@@ -3767,6 +3866,47 @@ elif REFERENCE_FACE_IMAGE and REALTIME_FACE_COMPARISON:
     print("\n⚠ REFERENCE_FACE_IMAGE provided but REALTIME_FACE_COMPARISON is enabled.")
     print("   Post-processing comparison requires REALTIME_FACE_COMPARISON=false")
 else:
-    print("\n[INFO] No reference face image provided via REFERENCE_FACE_IMAGE env var.")
-    print("       To run post-processing face comparison, set:")
-    print("       export REFERENCE_FACE_IMAGE=/path/to/face.jpg")
+    print("\n[INFO] No reference face image or text query provided.")
+    print("       To run queries after real-time ingest, set:")
+    print("       - export TEXT_QUERY='your query here'  (combined ingest + search)")
+    print("       To run post-processing queries on existing data, set REALTIME_FACE_COMPARISON=false and:")
+    print("       - export REFERENCE_FACE_IMAGE=/path/to/face.jpg  (image comparison)")
+    print("       - export TEXT_QUERY='your query here'            (text search)")
+
+# ===== OUTPUT STRUCTURED RESULTS AS JSON =====
+# Print final results as JSON for parsing by Temporal activity
+print("\n" + "="*80)
+print("[RESULTS-JSON]")
+import json
+results_dict = {
+    "video_id": VIDEO_ID,
+    "query_type": "text" if TEXT_QUERY else ("face" if REFERENCE_FACE_IMAGE else "ingest"),
+    "text_query": TEXT_QUERY,
+    "realtime_mode": REALTIME_FACE_COMPARISON,
+    "query_results": []  # Will be populated if query was run
+}
+
+# Populate query results if available
+try:
+    # matches is now defined at the module level and populated by cases above
+    if matches and len(matches) > 0:
+        for track_id, sim_score, payload in matches:
+            results_dict["query_results"].append({
+                "track_id": track_id,
+                "similarity_score": float(sim_score),
+                "start_time": payload.get('start_time'),
+                "end_time": payload.get('end_time'),
+                "num_frames": payload.get('num_frames'),
+                "upper_color": payload.get('upper_color'),
+                "lower_color": payload.get('lower_color'),
+                "attributes": payload.get('attributes', {}),
+                "object_carried": payload.get('object_carried', [])
+            })
+except Exception as e:
+    print(f"Warning: Could not serialize query results: {e}")
+
+print(json.dumps(results_dict))
+print("="*80)
+
+print(json.dumps(results_dict))
+print("="*80)

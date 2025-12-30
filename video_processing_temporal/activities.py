@@ -99,6 +99,49 @@ class VideoProcessingResult:
 
 
 # =============================================================================
+# Utility Activity: Cleanup downloaded local files (video and reference image)
+# =============================================================================
+
+@activity.defn
+async def cleanup_files_activity(paths: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Delete local files downloaded for processing to conserve disk space.
+
+    Args:
+        paths: Dict with optional keys 'video_path' and 'image_path'.
+
+    Returns:
+        Dict with deletion results per path.
+    """
+    results: Dict[str, Any] = {"video_deleted": False, "image_deleted": False}
+
+    def _delete_file(path: str) -> bool:
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+                return True
+            return False
+        except Exception as e:
+            activity.logger.warning(f"Failed to delete file {path}: {e}")
+            return False
+
+    video_path = (paths or {}).get("video_path")
+    image_path = (paths or {}).get("image_path")
+
+    if video_path:
+        deleted = _delete_file(video_path)
+        results["video_deleted"] = deleted
+        activity.logger.info(f"Cleanup video: path={video_path} deleted={deleted}")
+
+    if image_path:
+        deleted = _delete_file(image_path)
+        results["image_deleted"] = deleted
+        activity.logger.info(f"Cleanup image: path={image_path} deleted={deleted}")
+
+    return results
+
+
+# =============================================================================
 # Activity 1: Download Video from Backblaze S3
 # =============================================================================
 
@@ -207,20 +250,137 @@ async def download_video_activity(video_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =============================================================================
+# Activity 1b: Download Reference Image from S3 (Optional)
+# =============================================================================
+
+@activity.defn
+async def download_reference_image_activity(image_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Download reference image from S3 for post-processing face comparison.
+    If image_data is empty or None, this is a no-op and returns a flag.
+    
+    Args:
+        image_data: Dictionary containing:
+            - image_id: int
+            - file_name: str (S3 key, e.g., "images/94/timestamp-xxxxx.jpg")
+            - video_id: int (for logging)
+    
+    Returns:
+        Dictionary with local_path to the downloaded image, or status='no_image' if None
+    """
+    if not image_data:
+        activity.logger.info("No reference image provided; skipping download")
+        return {"status": "no_image", "local_path": None}
+    
+    video_id = image_data.get('video_id')
+    image_id = image_data.get('image_id')
+    
+    activity.logger.info(f"Starting reference image download for video_id: {video_id}, image_id: {image_id}")
+    
+    try:
+        # S3 Configuration (reuse same credentials as video)
+        ACCESS_KEY = os.getenv("S3_ACCESS_KEY_ID")
+        SECRET_KEY = os.getenv("S3_SECRET_ACCESS_KEY")
+        BUCKET = os.getenv("S3_BUCKET_NAME")
+        ENDPOINT = os.getenv("S3_ENDPOINT")
+        REGION = os.getenv("S3_REGION")
+        
+        if not all([ACCESS_KEY, SECRET_KEY, BUCKET, ENDPOINT, REGION]):
+            raise ValueError("Missing S3 configuration for image download")
+        
+        # Create S3 client
+        s3 = boto3.client(
+            "s3",
+            region_name=REGION,
+            endpoint_url=ENDPOINT,
+            aws_access_key_id=ACCESS_KEY,
+            aws_secret_access_key=SECRET_KEY,
+            config=Config(signature_version="s3v4"),
+        )
+        
+        file_name = image_data['file_name']
+        
+        # Generate presigned URL
+        presigned_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET, "Key": file_name},
+            ExpiresIn=3600,
+        )
+        
+        # Ensure output folder exists
+        output_folder = os.path.join(
+            os.path.dirname(__file__), 
+            "..", 
+            "download_video", 
+            "reference_images"
+        )
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Output path
+        local_filename = os.path.basename(file_name)
+        local_path = os.path.join(output_folder, local_filename)
+        
+        activity.logger.info(f"Downloading reference image from: {ENDPOINT}/{BUCKET}/{file_name}")
+        activity.logger.info(f"Saving to: {local_path}")
+        
+        # Stream download
+        response = requests.get(presigned_url, stream=True, timeout=60)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded_size = 0
+        
+        with open(local_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+        
+        activity.logger.info(f"✅ Reference image downloaded: {downloaded_size} bytes to {local_path}")
+        
+        return {
+            "status": "downloaded",
+            "image_id": image_id,
+            "video_id": video_id,
+            "local_path": local_path,
+            "file_size": downloaded_size
+        }
+        
+    except Exception as e:
+        activity.logger.error(f"❌ Error downloading reference image: {e}")
+        # Don't fail the workflow; just return no_image and processing will use default
+        return {"status": "error", "local_path": None, "error": str(e)}
+
+
+# =============================================================================
 # Activity 2: Process Video with Pipeline
 # =============================================================================
 
 @activity.defn
-async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, Any]:
+async def process_video_activity(process_input: Dict[str, Any]) -> Dict[str, Any]:
     """
     Process video using the cursor_muk_deepsort.py pipeline.
     
     Args:
-        download_result: Result from download_video_activity
+        process_input: Dictionary containing:
+            - download_result: Result from download_video_activity
+            - image_result: Result from download_reference_image_activity (optional)
+            - text_query: Text query for search (optional)
     
     Returns:
         Dictionary with processing results
     """
+    download_result = process_input.get('download_result')
+    image_result = process_input.get('image_result')
+    text_query = process_input.get('text_query')
+    
+    if not download_result:
+        raise ValueError("Missing download_result in process_input")
+    
+    # Either image or text query must be provided
+    if not image_result and not text_query:
+        raise ValueError("Either reference image or text query must be provided")
+    
     video_id = download_result['video_id']
     local_path = download_result['local_path']
     
@@ -246,6 +406,21 @@ async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, A
         env = os.environ.copy()
         env['VIDEO_ID'] = str(video_id)
         env['VIDEO_PATH'] = local_path
+        
+        # Set reference image if available; otherwise ensure any leaked env is removed
+        if image_result and image_result.get('status') == 'downloaded' and image_result.get('local_path'):
+            env['REFERENCE_FACE_IMAGE'] = image_result['local_path']
+            activity.logger.info(f"[PROCESS-IMAGE] Using reference image: {image_result['local_path']}")
+        else:
+            # Remove any pre-existing REFERENCE_FACE_IMAGE from parent env to prevent accidental default usage
+            if 'REFERENCE_FACE_IMAGE' in env:
+                env.pop('REFERENCE_FACE_IMAGE', None)
+                activity.logger.info("[PROCESS-IMAGE] No reference image provided; cleared REFERENCE_FACE_IMAGE from env")
+        
+        # Set text query if available
+        if text_query:
+            env['TEXT_QUERY'] = text_query
+            activity.logger.info(f"[PROCESS-TEXT] Using text query: {text_query}")
         
         # Run the pipeline as a subprocess
         activity.logger.info(f"Executing pipeline: python {pipeline_script}")
@@ -290,7 +465,7 @@ async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, A
             activity.logger.error(f"Error: {error_msg}")
             raise RuntimeError(f"Pipeline processing failed: {error_msg}")
         
-        # Parse output for statistics
+        # Parse output for statistics and query results
         output = stdout.decode()
         activity.logger.info("Pipeline output (last 500 chars):")
         activity.logger.info(output[-500:])
@@ -298,9 +473,23 @@ async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, A
         # Extract statistics from output if available
         total_persons = 0
         total_objects = 0
+        query_results = []
         
-        # You can parse the output to extract these stats
-        # For now, we'll leave them as 0 and update later
+        # Try to extract JSON results from output
+        try:
+            # Look for [RESULTS-JSON] marker and extract JSON
+            if "[RESULTS-JSON]" in output:
+                json_start = output.find("[RESULTS-JSON]") + len("[RESULTS-JSON]")
+                json_end = output.find("="*80, json_start)
+                if json_end > json_start:
+                    json_str = output[json_start:json_end].strip()
+                    results_data = json.loads(json_str)
+                    query_results = results_data.get("query_results", [])
+                    activity.logger.info(f"✅ Extracted {len(query_results)} query results from pipeline")
+        except json.JSONDecodeError as e:
+            activity.logger.warning(f"Could not parse JSON results from pipeline output: {e}")
+        except Exception as e:
+            activity.logger.warning(f"Error extracting query results: {e}")
         
         activity.logger.info(f"✅ Video processing complete for video_id: {video_id}")
         _post_status_update(video_id, 'postprocessing', 'Processing complete')
@@ -310,7 +499,8 @@ async def process_video_activity(download_result: Dict[str, Any]) -> Dict[str, A
             "status": "processed",
             "total_persons": total_persons,
             "total_objects": total_objects,
-            "local_path": local_path
+            "local_path": local_path,
+            "query_results": query_results
         }
         
     except asyncio.TimeoutError:
@@ -346,12 +536,13 @@ async def store_results_activity(processing_result: Dict[str, Any]) -> Dict[str,
     so this activity mainly verifies the storage and updates status.
     
     Args:
-        processing_result: Result from process_video_activity
+        processing_result: Result from process_video_activity (includes query_results if text/image query was run)
     
     Returns:
-        Dictionary with final results
+        Dictionary with final results including query_results if applicable
     """
     video_id = processing_result['video_id']
+    query_results = processing_result.get('query_results', [])
     
     activity.logger.info(f"Verifying Qdrant storage for video_id: {video_id}")
     
@@ -430,7 +621,8 @@ async def store_results_activity(processing_result: Dict[str, Any]) -> Dict[str,
             "status": "completed",
             "total_persons": person_count.count,
             "total_objects": object_count.count,
-            "qdrant_verified": True
+            "qdrant_verified": True,
+            "query_results": query_results  # Pass through any query results
         }
         
     except Exception as e:
@@ -443,6 +635,7 @@ async def store_results_activity(processing_result: Dict[str, Any]) -> Dict[str,
             "total_persons": 0,
             "total_objects": 0,
             "qdrant_verified": False,
+            "query_results": query_results,
             "error": str(e)
         }
 

@@ -29,9 +29,11 @@ from workflows import (
 )
 from activities import (
     download_video_activity,
+    download_reference_image_activity,
     process_video_activity,
     store_results_activity,
     update_video_status_activity,
+    cleanup_files_activity,
 )
 
 print("[OK] All imports successful", flush=True)
@@ -82,9 +84,11 @@ async def main():
         ],
         activities=[
             download_video_activity,
+            download_reference_image_activity,
             process_video_activity,
             store_results_activity,
             update_video_status_activity,
+            cleanup_files_activity,
         ],
         max_concurrent_activities=3,  # Process up to 3 videos concurrently
         max_concurrent_workflow_tasks=10,
@@ -103,9 +107,11 @@ async def main():
     logger.info("")
     logger.info("Available Activities:")
     logger.info("  - download_video_activity")
+    logger.info("  - download_reference_image_activity")
     logger.info("  - process_video_activity")
     logger.info("  - store_results_activity")
     logger.info("  - update_video_status_activity")
+    logger.info("  - cleanup_files_activity")
     logger.info("")
     logger.info("Waiting for workflow tasks...")
     logger.info("="*80)

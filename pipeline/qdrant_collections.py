@@ -51,9 +51,13 @@ def create_qdrant_schema(client: QdrantClient, realtime_mode: bool = True):
     """
     Creates or validates person_tracks and object_tracks collections.
     
+    IMPORTANT: This function NOW PRESERVES existing data!
+    - If collection exists: Keep all previous data, just create indexes if needed
+    - If collection doesn't exist: Create fresh collection
+    
     Args:
         client: QdrantClient instance
-        realtime_mode: If True, creates/recreates collections and indexes (REAL-TIME mode).
+        realtime_mode: If True, creates collections and indexes (REAL-TIME mode).
                       If False, only validates collections exist (POST-PROCESSING mode).
     
     PERSON_TRACKS: Stores one record per track (all face/ReID embeddings for that track)
@@ -81,15 +85,15 @@ def create_qdrant_schema(client: QdrantClient, realtime_mode: bool = True):
         print("✅ All collections validated successfully!")
         return True
     
-    # REAL-TIME MODE: Create/recreate collections and indexes
-    print("REAL-TIME MODE: Starting Qdrant collection setup and indexing...")
+    # REAL-TIME MODE: Create collections (if not exist) and indexes - PRESERVE EXISTING DATA
+    print("REAL-TIME MODE: Starting Qdrant collection setup and indexing (PRESERVING existing data)...")
     
-    # --- 3. Collection Creation ---
+    # --- 3. Collection Creation (CREATE ONLY IF NOT EXISTS) ---
 
-    # A. Create or Recreate person_tracks
+    # A. Create person_tracks (if it doesn't exist)
     try:
         if collection_exists(client, PERSON_TRACKS_COLLECTION):
-            print(f"✅ Collection '{PERSON_TRACKS_COLLECTION}' already exists")
+            print(f"✅ Collection '{PERSON_TRACKS_COLLECTION}' already exists - PRESERVING {client.count(PERSON_TRACKS_COLLECTION).count} records")
         else:
             client.create_collection(
                 collection_name=PERSON_TRACKS_COLLECTION,
@@ -100,10 +104,10 @@ def create_qdrant_schema(client: QdrantClient, realtime_mode: bool = True):
         print(f"⚠ Error with person_tracks collection: {e}")
         return False
 
-    # B. Create or Recreate object_tracks
+    # B. Create object_tracks (if it doesn't exist)
     try:
         if collection_exists(client, OBJECT_TRACKS_COLLECTION):
-            print(f"✅ Collection '{OBJECT_TRACKS_COLLECTION}' already exists")
+            print(f"✅ Collection '{OBJECT_TRACKS_COLLECTION}' already exists - PRESERVING {client.count(OBJECT_TRACKS_COLLECTION).count} records")
         else:
             client.create_collection(
                 collection_name=OBJECT_TRACKS_COLLECTION,
