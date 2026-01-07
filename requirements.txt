@@ -30,6 +30,10 @@ qdrant-client>=1.7.0
 boto3>=1.42.1
 python-dotenv>=1.2.1
 
+# Flask for Image Query Service
+flask>=3.0.0
+flask-cors>=4.0.0
+
 # OpenAI CLIP for text-image embeddings
 git+https://github.com/openai/CLIP.git
 

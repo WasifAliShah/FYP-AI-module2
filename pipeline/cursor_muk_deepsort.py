@@ -3907,6 +3907,3 @@ except Exception as e:
 
 print(json.dumps(results_dict))
 print("="*80)
-
-print(json.dumps(results_dict))
-print("="*80)
