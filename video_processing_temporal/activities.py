@@ -23,29 +23,7 @@ import subprocess
 import json
 from datetime import datetime
 
-BACKEND_INTERNAL_URL = os.getenv("BACKEND_INTERNAL_URL", "http://localhost:3000/internal/workflow-callback")
-WORKER_CALLBACK_TOKEN = os.getenv("WORKER_CALLBACK_TOKEN", None)
-
-def _post_status_update(video_id: int, stage: str, message: str = None, status: str = "info", error: str = None, details: dict = None):
-    try:
-        headers = {"Content-Type": "application/json"}
-        if WORKER_CALLBACK_TOKEN:
-            headers["x-worker-token"] = WORKER_CALLBACK_TOKEN
-        payload = {
-            "video_id": video_id,
-            "stage": stage,
-            "message": message,
-            "status": status,
-            "error": error,
-            "workflow_id": getattr(activity.info, 'workflow_id', None),
-            "workflow_run_id": getattr(activity.info, 'workflow_run_id', None),
-            "details": details or {}
-        }
-        requests.post(BACKEND_INTERNAL_URL, json=payload, headers=headers, timeout=10)
-    except Exception as e:
-        activity.logger.warning(f"Callback post failed: {e}")
-
-# Load environment variables from backend .env file
+# Load environment variables from backend .env file FIRST
 # Try multiple locations in case of different working directories
 def load_env_config():
     """Load environment variables from .env file"""
@@ -64,13 +42,43 @@ def load_env_config():
         expanded_path = os.path.expanduser(os.path.expandvars(env_path))
         if os.path.exists(expanded_path):
             load_dotenv(expanded_path)
-            logging.info(f"✅ Loaded environment from: {os.path.abspath(expanded_path)}")
+            print(f"✅ Loaded environment from: {os.path.abspath(expanded_path)}")
             return True
     
-    logging.warning("⚠️  No .env file found, using system environment variables")
+    print("⚠️  No .env file found, using system environment variables")
     return False
 
+# Call load_env_config BEFORE reading env vars
 load_env_config()
+
+# NOW read environment variables after .env is loaded
+BACKEND_INTERNAL_URL = os.getenv("BACKEND_INTERNAL_URL", "http://localhost:3000/internal/workflow-callback")
+WORKER_CALLBACK_TOKEN = os.getenv("WORKER_CALLBACK_TOKEN", None)
+
+print(f"[CONFIG] BACKEND_INTERNAL_URL = {BACKEND_INTERNAL_URL}")
+print(f"[CONFIG] WORKER_CALLBACK_TOKEN = {'SET' if WORKER_CALLBACK_TOKEN else 'NOT SET'}")
+
+def _post_status_update(video_id: int, stage: str, message: str = None, status: str = "info", error: str = None, details: dict = None):
+    try:
+        headers = {"Content-Type": "application/json"}
+        if WORKER_CALLBACK_TOKEN:
+            headers["x-worker-token"] = WORKER_CALLBACK_TOKEN
+        payload = {
+            "video_id": video_id,
+            "stage": stage,
+            "message": message,
+            "status": status,
+            "error": error,
+            "workflow_id": getattr(activity.info, 'workflow_id', None),
+            "workflow_run_id": getattr(activity.info, 'workflow_run_id', None),
+            "details": details or {}
+        }
+        print(f"[CALLBACK] Sending to {BACKEND_INTERNAL_URL} - stage: {stage}, video_id: {video_id}")
+        response = requests.post(BACKEND_INTERNAL_URL, json=payload, headers=headers, timeout=10)
+        print(f"[CALLBACK] Response: {response.status_code}")
+    except Exception as e:
+        print(f"[CALLBACK ERROR] Failed: {e}")
+        activity.logger.warning(f"Callback post failed: {e}")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -480,14 +488,34 @@ async def process_video_activity(process_input: Dict[str, Any]) -> Dict[str, Any
             # Look for [RESULTS-JSON] marker and extract JSON
             if "[RESULTS-JSON]" in output:
                 json_start = output.find("[RESULTS-JSON]") + len("[RESULTS-JSON]")
-                json_end = output.find("="*80, json_start)
-                if json_end > json_start:
-                    json_str = output[json_start:json_end].strip()
-                    results_data = json.loads(json_str)
-                    query_results = results_data.get("query_results", [])
-                    activity.logger.info(f"✅ Extracted {len(query_results)} query results from pipeline")
+                # Find the JSON object - look for opening brace
+                brace_start = output.find("{", json_start)
+                if brace_start >= 0:
+                    # Find matching closing brace by counting nested braces
+                    brace_count = 0
+                    brace_end = -1
+                    for i in range(brace_start, len(output)):
+                        if output[i] == '{':
+                            brace_count += 1
+                        elif output[i] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                brace_end = i + 1
+                                break
+                    
+                    if brace_end > brace_start:
+                        json_str = output[brace_start:brace_end]
+                        results_data = json.loads(json_str)
+                        query_results = results_data.get("query_results", [])
+                        activity.logger.info(f"✅ Extracted {len(query_results)} query results from pipeline")
+                        activity.logger.info(f"   Query results preview: {query_results[:2] if query_results else 'none'}")
+                    else:
+                        activity.logger.warning("Could not find closing brace for JSON in pipeline output")
+                else:
+                    activity.logger.warning("Could not find JSON object start after [RESULTS-JSON] marker")
         except json.JSONDecodeError as e:
             activity.logger.warning(f"Could not parse JSON results from pipeline output: {e}")
+            activity.logger.warning(f"   JSON string was: {json_str[:200] if 'json_str' in dir() else 'N/A'}")
         except Exception as e:
             activity.logger.warning(f"Error extracting query results: {e}")
         
@@ -614,7 +642,18 @@ async def store_results_activity(processing_result: Dict[str, Any]) -> Dict[str,
                 activity.logger.warning(f"Could not delete video file: {e}")
         
         activity.logger.info(f"✅ Results verified and stored for video_id: {video_id}")
-        _post_status_update(video_id, 'completed', 'Results stored', details={"persons": person_count.count, "objects": object_count.count})
+        activity.logger.info(f"   Query results to send: {len(query_results)} items")
+        if query_results:
+            activity.logger.info(f"   First result preview: {query_results[0] if query_results else 'N/A'}")
+        
+        # Include query_results in the callback details so backend can store in search_results table
+        callback_details = {
+            "persons": person_count.count, 
+            "objects": object_count.count,
+            "query_results": query_results  # Pass the actual query results to backend
+        }
+        activity.logger.info(f"📤 Sending callback with details: persons={callback_details['persons']}, objects={callback_details['objects']}, query_results_count={len(callback_details['query_results'])}")
+        _post_status_update(video_id, 'completed', 'Results stored', details=callback_details)
         
         return {
             "video_id": video_id,

@@ -3863,8 +3863,62 @@ elif TEXT_QUERY and not REALTIME_FACE_COMPARISON:
         traceback.print_exc()
 
 elif REFERENCE_FACE_IMAGE and REALTIME_FACE_COMPARISON:
-    print("\n⚠ REFERENCE_FACE_IMAGE provided but REALTIME_FACE_COMPARISON is enabled.")
-    print("   Post-processing comparison requires REALTIME_FACE_COMPARISON=false")
+    # Real-time mode with reference image: Query Qdrant for verified tracks
+    print("\n" + "="*80)
+    print("🔍 QUERYING VERIFIED TRACKS FROM QDRANT")
+    print("="*80)
+    print(f"   Video ID: {VIDEO_ID}")
+    print(f"   Reference image was used during processing")
+    print("="*80)
+    
+    try:
+        if client:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            
+            # Query for all verified person tracks for this video
+            search_filter = Filter(
+                must=[
+                    FieldCondition(key="video_id", match=MatchValue(value=VIDEO_ID)),
+                    FieldCondition(key="verified", match=MatchValue(value=True))
+                ]
+            )
+            
+            verified_results = client.scroll(
+                collection_name="person_tracks",
+                scroll_filter=search_filter,
+                limit=100,
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            if verified_results and verified_results[0]:
+                matches = []
+                for point in verified_results[0]:
+                    payload = point.payload or {}
+                    track_id = payload.get("track_id", "unknown")
+                    # Use a high similarity score since these were verified during processing
+                    sim_score = 0.95
+                    matches.append((track_id, sim_score, payload))
+                
+                print(f"\n✅ Found {len(matches)} verified person(s) in Qdrant")
+                for idx, (tid, score, pay) in enumerate(matches, 1):
+                    print(f"\n🎯 Verified Person #{idx}")
+                    print(f"   Track ID: {tid}")
+                    print(f"   Time Range: {pay.get('start_time')} → {pay.get('end_time')}")
+                    print(f"   Upper Color: {pay.get('upper_color', 'N/A')}")
+                    print(f"   Lower Color: {pay.get('lower_color', 'N/A')}")
+                    objs = pay.get('object_carried', [])
+                    if objs:
+                        print(f"   Carrying: {', '.join(objs) if isinstance(objs, list) else objs}")
+            else:
+                print("\n⚠ No verified persons found in Qdrant for this video")
+        else:
+            print("❌ Qdrant client not available")
+    except Exception as e:
+        print(f"\n❌ Error querying verified tracks: {e}")
+        import traceback
+        traceback.print_exc()
+
 else:
     print("\n[INFO] No reference face image or text query provided.")
     print("       To run queries after real-time ingest, set:")
