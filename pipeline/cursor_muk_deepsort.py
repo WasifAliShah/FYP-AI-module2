@@ -3874,6 +3874,18 @@ elif REFERENCE_FACE_IMAGE and REALTIME_FACE_COMPARISON:
     try:
         if client:
             from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+            # Build reference embedding so confidence reflects actual face similarity.
+            ref_embedding = None
+            try:
+                ref_img = cv2.imread(REFERENCE_FACE_IMAGE)
+                if ref_img is not None and fa is not None:
+                    ref_faces = fa.get(ref_img)
+                    if ref_faces:
+                        ref_embedding = np.array(ref_faces[0].embedding, dtype=np.float32)
+                        ref_embedding = ref_embedding / (np.linalg.norm(ref_embedding) + 1e-8)
+            except Exception as emb_err:
+                print(f"⚠ Could not build reference embedding for confidence scoring: {emb_err}")
             
             # Query for all verified person tracks for this video
             search_filter = Filter(
@@ -3888,7 +3900,7 @@ elif REFERENCE_FACE_IMAGE and REALTIME_FACE_COMPARISON:
                 scroll_filter=search_filter,
                 limit=100,
                 with_payload=True,
-                with_vectors=False
+                with_vectors=True
             )
             
             if verified_results and verified_results[0]:
@@ -3896,14 +3908,28 @@ elif REFERENCE_FACE_IMAGE and REALTIME_FACE_COMPARISON:
                 for point in verified_results[0]:
                     payload = point.payload or {}
                     track_id = payload.get("track_id", "unknown")
-                    # Use a high similarity score since these were verified during processing
-                    sim_score = 0.95
+
+                    # Compute confidence from reference embedding and stored face_vec.
+                    sim_score = 0.0
+                    if ref_embedding is not None and hasattr(point, "vector") and point.vector is not None:
+                        vec = point.vector.get("face_vec") if isinstance(point.vector, dict) else point.vector
+                        if vec is not None:
+                            vec_np = np.array(vec, dtype=np.float32)
+                            if vec_np.size == ref_embedding.size:
+                                sim_score = float(
+                                    np.dot(ref_embedding, vec_np)
+                                    / (np.linalg.norm(ref_embedding) * np.linalg.norm(vec_np) + 1e-8)
+                                )
+
                     matches.append((track_id, sim_score, payload))
+
+                matches.sort(key=lambda x: x[1], reverse=True)
                 
                 print(f"\n✅ Found {len(matches)} verified person(s) in Qdrant")
                 for idx, (tid, score, pay) in enumerate(matches, 1):
                     print(f"\n🎯 Verified Person #{idx}")
                     print(f"   Track ID: {tid}")
+                    print(f"   Similarity Score: {score:.4f} ({score*100:.2f}%)")
                     print(f"   Time Range: {pay.get('start_time')} → {pay.get('end_time')}")
                     print(f"   Upper Color: {pay.get('upper_color', 'N/A')}")
                     print(f"   Lower Color: {pay.get('lower_color', 'N/A')}")
