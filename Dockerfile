@@ -15,9 +15,9 @@ COPY requirements.txt .
 COPY video_processing_temporal/requirements.txt ./video_processing_temporal/
 
 # Install python dependencies
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir -r video_processing_temporal/requirements.txt
+RUN pip install --default-timeout=1000 --no-cache-dir --upgrade pip && \
+    pip install --default-timeout=1000 --no-cache-dir -r requirements.txt && \
+    pip install --default-timeout=1000 --no-cache-dir -r video_processing_temporal/requirements.txt
 
 # Copy the rest of the application code
 COPY . .
