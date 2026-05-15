@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     git \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
-
+    
 # Copy requirements files first to leverage Docker cache
 COPY requirements.txt .
 COPY video_processing_temporal/requirements.txt ./video_processing_temporal/
