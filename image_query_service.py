@@ -15,7 +15,7 @@ from query_image import handle_image_query
 from query_text import handle_text_query
 
 # Load environment variables
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 app = Flask(__name__)
 CORS(app)

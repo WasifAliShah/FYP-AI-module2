@@ -5,7 +5,7 @@ from botocore.client import Config
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 ACCESS_KEY = os.getenv("S3_ACCESS_KEY_ID")
 SECRET_KEY = os.getenv("S3_SECRET_ACCESS_KEY")

@@ -23,27 +23,23 @@ import subprocess
 import json
 from datetime import datetime
 
-# Load environment variables from backend .env file FIRST
-# Try multiple locations in case of different working directories
+# Load environment variables from the root FYP AI 2/.env file
 def load_env_config():
-    """Load environment variables from .env file"""
-    backend_env_paths = [
-        # Absolute path from workspace root
-        'C:/sabbas backend/VisionIndex-Backend/app/.env',
-        # Relative from current script
-        os.path.join(os.path.dirname(__file__), '../../VisionIndex-Backend/app/.env'),
-        # Relative from current working directory
-        os.path.join(os.getcwd(), '../VisionIndex-Backend/app/.env'),
-        'VisionIndex-Backend/app/.env',
-        '.env'  # Fallback to current directory
-    ]
+    """Load environment variables from the root .env file"""
+    # Primary: root FYP AI 2/.env (one level up from this script)
+    root_env = os.path.join(os.path.dirname(__file__), '..', '.env')
     
-    for env_path in backend_env_paths:
-        expanded_path = os.path.expanduser(os.path.expandvars(env_path))
-        if os.path.exists(expanded_path):
-            load_dotenv(expanded_path)
-            print(f"✅ Loaded environment from: {os.path.abspath(expanded_path)}")
-            return True
+    if os.path.exists(root_env):
+        load_dotenv(root_env)
+        print(f"✅ Loaded environment from: {os.path.abspath(root_env)}")
+        return True
+    
+    # Fallback: try backend .env
+    backend_env = os.path.join(os.path.dirname(__file__), '..', '..', 'VisionIndex-Backend', 'app', '.env')
+    if os.path.exists(backend_env):
+        load_dotenv(backend_env)
+        print(f"✅ Loaded environment from: {os.path.abspath(backend_env)}")
+        return True
     
     print("⚠️  No .env file found, using system environment variables")
     return False

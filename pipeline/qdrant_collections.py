@@ -7,7 +7,7 @@ from qdrant_client.models import Distance, VectorParams, models
 # --- 1. Environment and Constants ---
 
 # Load environment variables from .env file (for QDRANT_HOST, QDRANT_PORT)
-load_dotenv() 
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 # Define Collection Names
 PERSON_TRACKS_COLLECTION = "person_tracks"

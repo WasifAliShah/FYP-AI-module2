@@ -21,7 +21,7 @@ from PIL import Image
 import uuid
 
 # Load environment variables
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 # 1. Initialize the client
 # Try to be resilient: support QDRANT_URL (http) or host+port for gRPC
 from urllib.parse import urlparse
@@ -128,8 +128,8 @@ class _DeepSortByteTrackCompat:
             embedder_gpu=False,
             max_age=kwargs.get('track_buffer', 30),
             n_init=n_init_val,
-            max_iou_distance=0.7,  # Standard gating (0.7 is default, good for persons)
-            max_cosine_distance=0.2
+            max_iou_distance=0.85,  # Increased from 0.7 — tolerate more displacement for fast-moving persons
+            max_cosine_distance=0.3  # Slightly relaxed appearance matching (was 0.2)
         )
 
     def update(self, detections, img_info=None, img_size=None, frame=None):
@@ -222,7 +222,7 @@ else:
 YOLO_PERSON_MODEL = "yolov8m.pt"        # your person model
 YOLO_FACE_MODEL = "yolov8m-face.pt"     # recommended: yolov8n-face or yolov8m-face
 YOLO_OBJECT_MODEL = "yolov8m.pt"       # general object detection (laptops, phones, bags, etc.)
-DETECT_EVERY_N_FRAMES = 13  # Person detection frequency
+DETECT_EVERY_N_FRAMES = 5  # Reduced from 13 — faster detection keeps Kalman filter accurate for moving persons
 DETECT_OBJECTS_EVERY_N_FRAMES = 5  # Object detection frequency (faster for small moving objects)
 
 # Display scaling - adjust if video appears zoomed in/out
@@ -287,7 +287,7 @@ if USE_REAL_ESRGAN:
 # InsightFace (bigger input size for better accuracy on small faces)
 fa = None
 if INSIGHTFACE_AVAILABLE:
-    fa = FaceAnalysis(allowed_modules=['detection', 'landmark', 'recognition'])
+    fa = FaceAnalysis(allowed_modules=['detection', 'landmark', 'recognition', 'genderage'])
     print("Preparing InsightFace...")
     # -1 = CPU. If you have GPU and insightface compiled with GPU support, set ctx_id=0
     fa.prepare(ctx_id=-1, det_size=(1024, 1024))
@@ -410,9 +410,12 @@ def clip_encode(img):
     except Exception:
         return None
 
-def get_dominant_color(crop):
+def get_dominant_color(crop, debug=False):
     """Extract dominant clothing color from an image crop.
-    Prioritizes brown detection to avoid misclassifying it as white.
+    Uses HSV color space with careful discrimination between:
+      - brown vs orange (both H=10-25, differ by saturation)
+      - off-white vs blue (off-white has cool shadows that can read as blue)
+      - blue denim vs brown (blue H=100-130, brown H=0-25)
     Returns a simple color name or None.
     """
     if crop is None or crop.size == 0:
@@ -435,68 +438,77 @@ def get_dominant_color(crop):
         S = hsv[:, :, 1].reshape(-1)
         V = hsv[:, :, 2].reshape(-1)
         
-        # Calculate mean values for overall assessment
         v_mean = float(np.mean(V))
         s_mean = float(np.mean(S))
-
-        # FIRST: Check for BROWN before white (brown can look desaturated)
-        # Brown detection in darker warm hues - STRICT to avoid false positives
-        # Require higher saturation and narrower hue range for brown
-        brown_mask = ((H < 20) | (H > 165)) & (V >= 40) & (V < 130) & (S > 40)  # Stricter: narrower hue, higher sat, not too dark
-        brown_ratio = float(np.sum(brown_mask) / H.size) if H.size > 0 else 0
-        # Also detect tan/light brown: warm hues with moderate saturation
-        tan_mask = ((H < 20) | (H > 165)) & (V >= 130) & (V < 180) & (S >= 35) & (S < 85)
-        tan_ratio = float(np.sum(tan_mask) / H.size) if H.size > 0 else 0
+        h_mean = float(np.mean(H))
         
-        # Only return brown if VERY dominant (>40%) to avoid false positives from shadows
-        if brown_ratio > 0.40 or tan_ratio > 0.40:
-            return "brown"
-        # Or if both together are strong and mean saturation suggests brown
-        if (brown_ratio + tan_ratio) > 0.50 and s_mean > 35 and 50 < v_mean < 160:
-            return "brown"
+        # Count pixel hue distribution for decision making
+        warm_hue_pixels = np.sum((H < 25) | (H > 165))  # red/orange/brown range
+        cool_hue_pixels = np.sum((H >= 90) & (H <= 135))  # blue/cyan range
+        total_pixels = max(1, H.size)
+        warm_hue_pct = warm_hue_pixels / total_pixels
+        cool_hue_pct = cool_hue_pixels / total_pixels
+
+        if debug:
+            print(f"    [COLOR DEBUG] H_mean={h_mean:.1f} S_mean={s_mean:.1f} V_mean={v_mean:.1f} | warm_hue={warm_hue_pct:.2f} cool_hue={cool_hue_pct:.2f}")
+
+        # ============================================================
+        # EARLY BLUE GUARD: If >25% of pixels have blue hue AND blue dominates warm
+        # The cool > warm check prevents orange shirts with blue background from being classified as blue
+        # ============================================================
+        if cool_hue_pct > 0.25 and s_mean > 20 and cool_hue_pct > warm_hue_pct:
+            if v_mean < 100:
+                return "dark blue"
+            return "blue"
+
+        # ============================================================
+        # OFF-WHITE / CREAM detection (before brown, catches light fabrics)
+        # Only return white if there's NO dominant hue (warm or cool)
+        # ============================================================
+        if v_mean > 170 and s_mean < 60 and warm_hue_pct < 0.25 and cool_hue_pct < 0.25:
+            return "white"
+        if v_mean > 160 and s_mean < 40 and warm_hue_pct < 0.30 and cool_hue_pct < 0.30:
+            return "white"
+
+        # ============================================================
+        # BROWN / TAN: Handled by hue histogram below.
+        # Early brown detection removed — it consistently misclassified
+        # desaturated orange as brown. The hue histogram naturally returns
+        # 'red' or 'orange' for warm-hued clothing.
+        # ============================================================
+        total_brown_ratio = 0.0
 
         # PRIORITY 1: BLACK detection (very dark)
         black_mask = (V < 60)
-        black_ratio = float(np.sum(black_mask) / H.size) if H.size > 0 else 0
-        # Allow slightly brighter blacks to count if saturation is low (matte black) and brown is not dominant
-        if (v_mean < 65 and s_mean < 85 and brown_ratio < 0.10) or black_ratio > 0.25:
+        black_ratio = float(np.sum(black_mask) / total_pixels)
+        if (v_mean < 65 and s_mean < 85 and total_brown_ratio < 0.15) or black_ratio > 0.25:
             return "black"
 
-        # PRIORITY 2: WHITE detection (very bright + desaturated)
-        # White = very high brightness + very low saturation, but NOT warm-hued
+        # PRIORITY 2: WHITE detection (catches remaining whites)
         white_mask = (V > 190) & (S < 50)
-        white_ratio = float(np.sum(white_mask) / H.size) if H.size > 0 else 0
+        white_ratio = float(np.sum(white_mask) / total_pixels)
         
-        # Only white if no warm/brown hues dominate
-        warm_hues = ((H < 30) | (H > 160))
-        warm_ratio = float(np.sum(warm_hues) / H.size) if H.size > 0 else 0
-        
-        # Return white ONLY if very bright, very desaturated, AND not dominated by warm hues
-        if v_mean > 205 and s_mean < 50 and warm_ratio < 0.30:
+        if v_mean > 200 and s_mean < 50:
             return "white"
-        if v_mean > 200 and s_mean < 40 and warm_ratio < 0.25:
-            return "white"
-        if white_ratio > 0.35 and s_mean < 45 and warm_ratio < 0.25:
+        if white_ratio > 0.30 and s_mean < 50:
             return "white"
         
-        # PRIORITY 3: GRAY detection (only if clearly not white/brown)
-        # Gray = low saturation, moderate brightness (neither white nor black nor brown)
-        gray_mask = (S < 45) & (V >= 50) & (V <= 190)
-        gray_ratio = float(np.sum(gray_mask) / H.size) if H.size > 0 else 0
+        # PRIORITY 3: GRAY detection
+        gray_mask = (S < 45) & (V >= 50) & (V <= 195)
+        gray_ratio = float(np.sum(gray_mask) / total_pixels)
         
-        # Gray only if saturation is very low and brightness is moderate, and not brown
-        if gray_ratio > 0.45 and v_mean < 195 and brown_ratio < 0.15:
+        if gray_ratio > 0.40 and total_brown_ratio < 0.15:
             return "gray"
-        if s_mean < 35 and 80 < v_mean < 190 and brown_ratio < 0.15:
+        if s_mean < 35 and 70 < v_mean < 195 and total_brown_ratio < 0.15:
             return "gray"
 
         # Filter to colorful pixels for hue analysis
         valid = (V > 35) & (V < 245) & (S > 30)
-        if np.sum(valid) < 80:
-            # Not enough colorful pixels: choose closest achromatic class by averages
+        n_valid = int(np.sum(valid))
+        if n_valid < 80:
             if v_mean < 55:
                 return "black"
-            if v_mean > 195 and s_mean < 45 and brown_ratio < 0.20:
+            if v_mean > 180 and s_mean < 50:
                 return "white"
             return "gray" if s_mean < 50 else None
 
@@ -514,17 +526,19 @@ def get_dominant_color(crop):
             4: "cyan", 5: "blue", 6: "purple", 7: "magenta", 8: "red",
         }
 
-        if np.mean(Sv) < 55:
+        mean_sv = float(np.mean(Sv))
+        mean_vv = float(np.mean(Vv))
+        
+        if debug:
+            print(f"    [COLOR DEBUG] Hue histogram: {hist.tolist()} -> bin {idx} -> '{color_map.get(idx)}'  mean_Sv={mean_sv:.1f} mean_Vv={mean_vv:.1f}")
+
+        if mean_sv < 55:
             return "gray"
 
         dominant_color = color_map.get(idx, None)
         
-        # BROWN OVERRIDE: If dominant is orange/red but brightness is low or saturation suggests brown
-        if dominant_color in ("orange", "red") and (np.mean(Vv) < 140 or np.mean(Sv) < 50):
-            return "brown"
-        
-        # WHITE OVERRIDE: only for truly desaturated warm tones
-        if dominant_color in ("orange", "yellow") and np.mean(Sv) < 65 and np.mean(Vv) > 210:
+        # WHITE OVERRIDE: desaturated warm tones
+        if dominant_color in ("orange", "yellow") and mean_sv < 65 and mean_vv > 200:
             return "white"
         
         return dominant_color
@@ -660,39 +674,130 @@ def detect_person_attributes(crop, face_crop=None):
         # If detection fails, return neutral attributes (all False)
         return attributes
 
-def extract_face_embedding_optimized(crop_person, face_boxes_frame, person_box):
+def extract_face_embedding_optimized(crop_person, face_boxes_frame, person_box, frame=None):
     """
-    Extract face embedding from person crop using InsightFace.
+    Extract face embedding AND gender from person crop using InsightFace.
+    
+    Uses a 4-attempt strategy for maximum face detection reliability:
+    1. InsightFace on person crop (fast, works for normal distance)
+    2. YOLO face crop + multi-scale InsightFace (handles close-ups)
+    3. Downscaled person crop at multiple scales (different anchor matches)
+    4. InsightFace on full frame (most reliable, works at any distance/angle)
     
     Args:
         crop_person: Person crop image (BGR)
-        face_boxes_frame: List of face boxes detected in the frame
-        person_box: Person bounding box [x1, y1, x2, y2]
+        face_boxes_frame: List of YOLO face boxes [(x1,y1,x2,y2),...] in frame coords
+        person_box: Person bounding box [x1, y1, x2, y2] in frame coords
+        frame: Full video frame (BGR), optional - enables full-frame face detection
     
     Returns:
-        tuple: (face_embedding, face_size) where face_size is the width of the detected face
+        tuple: (face_embedding, face_size, gender)
     """
     if not fa or not INSIGHTFACE_AVAILABLE:
-        return None, 0
+        return None, 0, None
+    
+    def _extract_gender(face_obj):
+        """Helper to extract gender from InsightFace face object."""
+        if hasattr(face_obj, 'gender'):
+            return 'male' if face_obj.gender == 1 else 'female'
+        elif hasattr(face_obj, 'sex'):
+            return 'male' if face_obj.sex == 1 else 'female'
+        return None
     
     try:
-        # Use InsightFace to detect faces in the person crop
-        faces = fa.get(crop_person)
+        cp_h, cp_w = crop_person.shape[:2]
+        n_yolo_faces = len(face_boxes_frame) if face_boxes_frame else 0
         
+        # === ATTEMPT 1: Run InsightFace on the full person crop ===
+        faces = fa.get(crop_person)
         if faces and len(faces) > 0:
-            # Use the first (best) face detected
             face = faces[0]
-            face_emb = normalize(np.array(face.embedding))
-            # Face size is the width of the bounding box
-            face_size = int(face.bbox[2] - face.bbox[0])
-            return face_emb, face_size
-        else:
-            # No face detected
-            return None, 0
+            return normalize(np.array(face.embedding)), int(face.bbox[2] - face.bbox[0]), _extract_gender(face)
+        
+        # === ATTEMPT 2: Use YOLO face box → crop face region → multi-scale retry ===
+        if face_boxes_frame and person_box is not None:
+            px1, py1, px2, py2 = person_box
+            
+            for (fx1, fy1, fx2, fy2) in face_boxes_frame:
+                # Check if this face overlaps with the person box
+                if min(px2, fx2) <= max(px1, fx1) or min(py2, fy2) <= max(py1, fy1):
+                    continue
+                
+                # Map face box to person crop coordinates
+                face_crop_x1 = max(0, fx1 - px1)
+                face_crop_y1 = max(0, fy1 - py1)
+                face_crop_x2 = min(cp_w, fx2 - px1)
+                face_crop_y2 = min(cp_h, fy2 - py1)
+                
+                face_w = face_crop_x2 - face_crop_x1
+                face_h = face_crop_y2 - face_crop_y1
+                if face_w < 20 or face_h < 20:
+                    continue
+                
+                # Add padding (60%) for InsightFace alignment context
+                pad_x = int(face_w * 0.6)
+                pad_y = int(face_h * 0.6)
+                padded_x1 = max(0, face_crop_x1 - pad_x)
+                padded_y1 = max(0, face_crop_y1 - pad_y)
+                padded_x2 = min(cp_w, face_crop_x2 + pad_x)
+                padded_y2 = min(cp_h, face_crop_y2 + pad_y)
+                
+                face_region = crop_person[padded_y1:padded_y2, padded_x1:padded_x2]
+                if face_region.size == 0:
+                    continue
+                
+                # Try multiple scales — different anchor sizes work for different face angles
+                fr_h, fr_w = face_region.shape[:2]
+                for target_size in [640, 400, 300, 200]:
+                    if max(fr_h, fr_w) > target_size * 0.8:
+                        s = target_size / max(fr_h, fr_w)
+                        resized = cv2.resize(face_region, (int(fr_w * s), int(fr_h * s)), interpolation=cv2.INTER_AREA)
+                    else:
+                        resized = face_region
+                    
+                    faces = fa.get(resized)
+                    if faces and len(faces) > 0:
+                        face = faces[0]
+                        return normalize(np.array(face.embedding)), face_w, _extract_gender(face)
+        
+        # === ATTEMPT 3: Downscale person crop at multiple scales ===
+        if max(cp_h, cp_w) > 300:
+            for target_size in [640, 400, 250]:
+                scale = target_size / max(cp_h, cp_w)
+                small_crop = cv2.resize(crop_person, (int(cp_w * scale), int(cp_h * scale)), interpolation=cv2.INTER_AREA)
+                faces = fa.get(small_crop)
+                if faces and len(faces) > 0:
+                    face = faces[0]
+                    face_size = int((face.bbox[2] - face.bbox[0]) / scale)
+                    return normalize(np.array(face.embedding)), face_size, _extract_gender(face)
+        
+        # === ATTEMPT 4: Run InsightFace on the FULL FRAME ===
+        if frame is not None and person_box is not None:
+            faces = fa.get(frame)
+            if faces and len(faces) > 0:
+                px1, py1, px2, py2 = person_box
+                best_face = None
+                best_overlap = 0
+                for face in faces:
+                    fb = face.bbox
+                    ox1 = max(px1, fb[0]); oy1 = max(py1, fb[1])
+                    ox2 = min(px2, fb[2]); oy2 = min(py2, fb[3])
+                    if ox2 > ox1 and oy2 > oy1:
+                        overlap = (ox2 - ox1) * (oy2 - oy1)
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best_face = face
+                
+                if best_face is not None:
+                    face_size = int(best_face.bbox[2] - best_face.bbox[0])
+                    return normalize(np.array(best_face.embedding)), face_size, _extract_gender(best_face)
+        
+        # All attempts failed
+        return None, 0, None
             
     except Exception as e:
-        print(f"⚠ Face embedding extraction failed: {e}")
-        return None, 0
+        print(f"Face embedding extraction failed: {e}")
+        return None, 0, None
 
 # ----------------------
 # Build reference embeddings
@@ -1018,27 +1123,136 @@ def reassign_small_object_ids(object_tracklets, class_keywords, iou_thresh=0.4, 
         pass
 
 # ----------------------
-# Qdrant insertion function for verified tracklets
+# Qdrant insertion function for verified tracklets (with Person ReID)
 # ----------------------
 import uuid
 from datetime import datetime
 
-def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, frame_rate=30.0):
+# Person ReID matching thresholds
+PERSON_REID_WEIGHT = 0.65   # ReID embedding weight (primary)
+PERSON_FACE_WEIGHT = 0.35   # Face embedding weight (confirmation)
+PERSON_MATCH_THRESHOLD = 0.70  # Fused similarity threshold for matching
+
+def find_similar_person_tracks(client, reid_embedding, face_embedding, video_id, threshold=None, top_k=5):
     """
-    Insert a tracklet into Qdrant person_tracks collection.
-    
-    Stores averaged face and ReID embeddings with metadata for similarity search.
-    Works for both verified and unverified tracklets.
+    Search Qdrant person_tracks for existing persons that match this tracklet.
+    Uses reid_vec as primary (65% weight) and face_vec as confirmation (35% weight).
     
     Args:
         client: QdrantClient instance
-        tracklet: Tracklet object (verified or unverified) with avg face/reid embeddings
-        video_id: Video ID from PostgreSQL videos table
-        segment_id: Optional segment ID for video_segments table link
-        frame_rate: Video frame rate for time calculations
+        reid_embedding: 512D ReID embedding (normalized)
+        face_embedding: 512D face embedding (normalized), can be zero vector
+        video_id: Video ID to filter by
+        threshold: Fused similarity threshold (default: PERSON_MATCH_THRESHOLD)
+        top_k: Max results to return
     
     Returns:
-        bool: True if insertion succeeded, False otherwise
+        list: [(point_id, track_id, fused_similarity, payload), ...] sorted by fused_sim desc
+    """
+    if not client:
+        return []
+    if threshold is None:
+        threshold = PERSON_MATCH_THRESHOLD
+    
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        
+        # Filter by video_id
+        search_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="video_id",
+                    match=MatchValue(value=video_id)
+                )
+            ]
+        )
+        
+        # Check if embeddings have real data
+        reid_has_data = reid_embedding is not None and np.sum(np.abs(reid_embedding)) > 0.01
+        face_has_data = face_embedding is not None and np.sum(np.abs(face_embedding)) > 0.01
+        
+        if not reid_has_data and not face_has_data:
+            return []
+        
+        # Scroll all person tracks for this video with vectors
+        points, _ = client.scroll(
+            collection_name="person_tracks",
+            scroll_filter=search_filter,
+            limit=1000,
+            with_payload=True,
+            with_vectors=True,
+        )
+        
+        if not points:
+            return []
+        
+        matches = []
+        for p in points:
+            if not hasattr(p, "vector") or p.vector is None:
+                continue
+            
+            # Get stored vectors
+            stored_reid = None
+            stored_face = None
+            if isinstance(p.vector, dict):
+                stored_reid = p.vector.get("reid_vec")
+                stored_face = p.vector.get("face_vec")
+            
+            if stored_reid is None:
+                continue
+            
+            stored_reid_np = np.array(stored_reid, dtype=np.float32)
+            stored_face_np = np.array(stored_face, dtype=np.float32) if stored_face else np.zeros(512, dtype=np.float32)
+            
+            # Skip zero-vector entries
+            if np.sum(np.abs(stored_reid_np)) < 0.01:
+                continue
+            
+            # Compute cosine similarities
+            reid_sim = 0.0
+            face_sim = 0.0
+            
+            if reid_has_data:
+                reid_sim = float(np.dot(reid_embedding, stored_reid_np) / 
+                               (np.linalg.norm(reid_embedding) * np.linalg.norm(stored_reid_np) + 1e-8))
+            
+            if face_has_data and np.sum(np.abs(stored_face_np)) > 0.01:
+                face_sim = float(np.dot(face_embedding, stored_face_np) / 
+                               (np.linalg.norm(face_embedding) * np.linalg.norm(stored_face_np) + 1e-8))
+            
+            # Fused similarity (weighted combination)
+            if face_has_data and np.sum(np.abs(stored_face_np)) > 0.01:
+                fused_sim = PERSON_REID_WEIGHT * reid_sim + PERSON_FACE_WEIGHT * face_sim
+            else:
+                # No face data available - use ReID only
+                fused_sim = reid_sim
+            
+            if fused_sim >= threshold:
+                payload = p.payload if hasattr(p, "payload") else {}
+                point_id = p.id
+                track_id = payload.get("track_id", "unknown")
+                mode = "ReID+Face FUSION" if (face_has_data and np.sum(np.abs(stored_face_np)) > 0.01) else "ReID ONLY"
+                print(f"   🔍 ReID match candidate: Track {track_id} | {mode} | reid_sim={reid_sim:.4f}, face_sim={face_sim:.4f}, fused={fused_sim:.4f}")
+                matches.append((point_id, track_id, fused_sim, payload))
+        
+        # Sort by fused similarity descending
+        matches.sort(key=lambda x: x[2], reverse=True)
+        return matches[:top_k]
+        
+    except Exception as e:
+        print(f"⚠ Error searching for similar person tracks: {e}")
+        return []
+
+
+def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, frame_rate=30.0):
+    """
+    Insert a tracklet into Qdrant person_tracks collection WITH PERSON RE-IDENTIFICATION.
+    
+    Before inserting, searches for similar existing person tracks in Qdrant.
+    If a match is found:
+      - Time gap > 1s: marks as REAPPEARANCE (updates existing record)
+      - Time gap <= 1s: MERGES into existing record (continuous tracking)
+    If no match: inserts as NEW person.
     """
     # Skip inserts in POST-PROCESSING mode
     try:
@@ -1050,35 +1264,28 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
         return False
     
     try:
-        # Get averaged embeddings (may be None for unverified tracklets)
+        # Get averaged embeddings
         face_avg = tracklet.avg_face()
         reid_avg = tracklet.avg_reid()
         
-        # For unverified tracklets, we still need at least ReID embedding to insert
-        # If both are None, skip insertion (no useful data)
         if face_avg is None and reid_avg is None:
             print(f"⚠ Skipping tracklet {tracklet.id} - no embeddings available")
             return False
         
-        # Use zero vectors as fallback if embeddings are missing
+        # Use zero vectors as fallback
         if face_avg is None:
             face_avg = np.zeros(512, dtype=np.float32)
         if reid_avg is None:
             reid_avg = np.zeros(512, dtype=np.float32)
         
-        # Generate unique ID for this tracklet entry
-        point_id = str(uuid.uuid4())
-        
-        # Calculate time range based on when the tracklet first/last appeared
+        # Calculate time range
         start_frame = tracklet.first_frame if hasattr(tracklet, 'first_frame') else 0
         end_frame = tracklet.last_frame if hasattr(tracklet, 'last_frame') else start_frame
         num_frames = max(1, end_frame - start_frame + 1)
         
-        # Estimate time in seconds using frame rate
         start_time_sec = start_frame / max(frame_rate, 1.0)
         end_time_sec = end_frame / max(frame_rate, 1.0)
         
-        # Format as HH:MM:SS.mmm (keep milliseconds to avoid truncation)
         def seconds_to_hms_ms(secs):
             h = int(secs // 3600)
             m = int((secs % 3600) // 60)
@@ -1089,38 +1296,12 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
         start_time_str = seconds_to_hms_ms(start_time_sec)
         end_time_str = seconds_to_hms_ms(end_time_sec)
         
-        # Build payload per spec (NO camera_id)
-        payload = {
-            "video_id": video_id,
-            "track_id": tracklet.id,
-            "start_time": start_time_str,
-            "end_time": end_time_str,
-            "num_frames": num_frames,
-            "avg_confidence": 0.85,  # placeholder, can extract from tracklet if available
-            "timestamp": datetime.now().isoformat(),
-        }
-        
-        # Add optional segment_id if provided
-        if segment_id is not None:
-            payload["segment_id"] = segment_id
-        
-        # Optional fields (set None/empty for now, extend later with attribute detection)
-        payload["person_gender"] = None
-        payload["upper_color"] = tracklet.get_dominant_upper_color()
-        payload["lower_color"] = tracklet.get_dominant_lower_color()
-        payload["attributes"] = tracklet.get_attribute_summary()  # Dictionary of detected attributes
-        payload["object_carried"] = tracklet.carried_summary()
-        payload["verified"] = tracklet.verified  # Indicate if this tracklet was verified against reference
-        
         # Convert embeddings to lists for Qdrant
         face_vec = face_avg.tolist() if isinstance(face_avg, np.ndarray) else list(face_avg)
         reid_vec = reid_avg.tolist() if isinstance(reid_avg, np.ndarray) else list(reid_avg)
         
-        # multi_vec: prefer CLIP embedding, fallback to face embedding (both 512D now)
         clip_avg = tracklet.avg_clip()
-
         def pad_to_512(vec):
-            """Pad vector to 512D by appending zeros."""
             vec_list = vec.tolist() if isinstance(vec, np.ndarray) else list(vec)
             if len(vec_list) >= 512:
                 return vec_list[:512]
@@ -1131,28 +1312,168 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
         else:
             multi_vec = pad_to_512(face_avg)
         
-        # Build vectors dict for NamedVectors (per spec: all 512D - InsightFace, TorchReID, CLIP ViT-B/32)
         vectors = {
-            "face_vec": face_vec,          # 512D (InsightFace)
-            "reid_vec": reid_vec,          # 512D (TorchReID)
-            "multi_vec": multi_vec,        # 512D (CLIP ViT-B/32 or padded face_vec)
+            "face_vec": face_vec,
+            "reid_vec": reid_vec,
+            "multi_vec": multi_vec,
         }
         
-        # Insert to Qdrant (quiet success)
-        point = PointStruct(
-            id=point_id,
-            vector=vectors,  # NamedVectors
-            payload=payload
-        )
-        client.upsert(
-            collection_name="person_tracks",
-            points=[point]
+        # Build base payload
+        payload = {
+            "video_id": video_id,
+            "track_id": tracklet.id,
+            "start_time": start_time_str,
+            "end_time": end_time_str,
+            "num_frames": num_frames,
+            "avg_confidence": 0.85,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        if segment_id is not None:
+            payload["segment_id"] = segment_id
+        
+        payload["person_gender"] = tracklet.get_dominant_gender()
+        payload["upper_color"] = tracklet.get_dominant_upper_color()
+        payload["lower_color"] = tracklet.get_dominant_lower_color()
+        payload["attributes"] = tracklet.get_attribute_summary()
+        payload["object_carried"] = tracklet.carried_summary()
+        payload["verified"] = tracklet.verified
+        
+        # ===== PERSON RE-IDENTIFICATION: Search before insert =====
+        similar_tracks = find_similar_person_tracks(
+            client,
+            reid_embedding=reid_avg,
+            face_embedding=face_avg,
+            video_id=video_id,
+            threshold=PERSON_MATCH_THRESHOLD,
+            top_k=5
         )
         
-        # Simple success message
-        status = "VERIFIED" if tracklet.verified else "UNVERIFIED"
-        print(f"✓ Inserted {status} tracklet {tracklet.id} to Qdrant")
-        return True
+        if similar_tracks:
+            # Match found — merge or mark as reappearance
+            existing_point_id, best_match_track_id, best_similarity, best_payload = similar_tracks[0]
+            existing_end_time_str = best_payload.get("end_time", "00:00:00.000")
+            
+            # Parse existing end time
+            try:
+                parts = existing_end_time_str.split(":")
+                h = int(parts[0])
+                m = int(parts[1])
+                s_ms = parts[2].split(".")
+                s = int(s_ms[0])
+                ms = int(s_ms[1]) if len(s_ms) > 1 else 0
+                existing_end_sec = h * 3600 + m * 60 + s + ms / 1000.0
+            except:
+                existing_end_sec = 0
+            
+            time_diff = start_time_sec - existing_end_sec
+            
+            # Merge into existing record
+            merged_payload = best_payload.copy()
+            merged_payload["num_frames"] = merged_payload.get("num_frames", 0) + num_frames
+            merged_payload["avg_confidence"] = (best_payload.get("avg_confidence", 0) + payload["avg_confidence"]) / 2
+            
+            # Update clothing/attributes with latest data
+            if payload.get("upper_color"):
+                merged_payload["upper_color"] = payload["upper_color"]
+            if payload.get("lower_color"):
+                merged_payload["lower_color"] = payload["lower_color"]
+            if payload.get("person_gender"):
+                merged_payload["person_gender"] = payload["person_gender"]
+            if payload.get("attributes"):
+                merged_payload["attributes"] = payload["attributes"]
+            if payload.get("object_carried"):
+                merged_payload["object_carried"] = payload["object_carried"]
+            if payload.get("verified"):
+                merged_payload["verified"] = True
+            
+            # Initialize reappearance fields if not present
+            if "first_appearance_time" not in merged_payload:
+                merged_payload["first_appearance_time"] = best_payload.get("start_time", start_time_str)
+                merged_payload["last_appearance_time"] = best_payload.get("end_time", end_time_str)
+                merged_payload["total_appearances"] = 1
+                merged_payload["appearance_count"] = 1
+                merged_payload["reappearances"] = []
+            
+            if time_diff > 1.0:
+                # REAPPEARANCE: Person left and came back
+                print(f"🔄 Person Track {tracklet.id} → REAPPEARANCE of Track {best_match_track_id} (gap: {time_diff:.2f}s, fused_sim: {best_similarity:.4f})")
+                print(f"   ReID match: Previous ended: {existing_end_time_str} | New starts: {start_time_str}")
+                
+                merged_payload["total_appearances"] = merged_payload.get("total_appearances", 1) + 1
+                merged_payload["appearance_count"] = merged_payload.get("appearance_count", 1) + 1
+                
+                duration_sec = end_time_sec - start_time_sec
+                reappearance_info = {
+                    "track_id": tracklet.id,
+                    "appearance_num": merged_payload.get("appearance_count", 1),
+                    "start_time": start_time_str,
+                    "end_time": end_time_str,
+                    "duration_sec": duration_sec,
+                    "time_gap_sec": time_diff,
+                    "num_frames": num_frames,
+                    "avg_confidence": payload["avg_confidence"],
+                    "reid_similarity": best_similarity,
+                    "upper_color": payload.get("upper_color"),
+                    "lower_color": payload.get("lower_color"),
+                    "timestamp": datetime.now().isoformat()
+                }
+                merged_payload["reappearances"].append(reappearance_info)
+                merged_payload["has_reappearance"] = True
+                merged_payload["last_appearance_time"] = end_time_str
+            else:
+                # MERGE: Same person, continuous tracking (gap <= 1s)
+                print(f"🔗 Person Track {tracklet.id} → MERGED with Track {best_match_track_id} (gap: {time_diff:.2f}s, fused_sim: {best_similarity:.4f})")
+                merged_payload["last_appearance_time"] = end_time_str
+                merged_payload["end_time"] = end_time_str
+            
+            merged_payload["merged_track_ids"] = merged_payload.get("merged_track_ids", []) + [tracklet.id]
+            merged_payload["last_update_time"] = datetime.now().isoformat()
+            
+            # Upsert updated point back to Qdrant (same point_id)
+            point = PointStruct(
+                id=existing_point_id,
+                vector=vectors,
+                payload=merged_payload
+            )
+            client.upsert(
+                collection_name="person_tracks",
+                points=[point]
+            )
+            status = "VERIFIED" if tracklet.verified else "UNVERIFIED"
+            print(f"✓ UPDATED existing person record ({status}, Track {best_match_track_id}) | Gender: {merged_payload.get('person_gender', 'N/A')} | Upper: {merged_payload.get('upper_color', 'N/A')} | Lower: {merged_payload.get('lower_color', 'N/A')}")
+            return True
+
+
+        else:
+            # No match found — insert as NEW person
+            print(f"✨ Person Track {tracklet.id} is NEW, inserting...")
+            point_id = str(uuid.uuid4())
+            
+            # Initialize unified schema for new persons
+            new_payload = payload.copy()
+            new_payload["first_appearance_time"] = start_time_str
+            new_payload["last_appearance_time"] = end_time_str
+            new_payload["total_appearances"] = 1
+            new_payload["appearance_count"] = 1
+            new_payload["reappearances"] = []
+            new_payload["has_reappearance"] = False
+            new_payload["merged_track_ids"] = []
+            new_payload["creation_time"] = datetime.now().isoformat()
+            new_payload["last_update_time"] = datetime.now().isoformat()
+            
+            point = PointStruct(
+                id=point_id,
+                vector=vectors,
+                payload=new_payload
+            )
+            client.upsert(
+                collection_name="person_tracks",
+                points=[point]
+            )
+            status = "VERIFIED" if tracklet.verified else "UNVERIFIED"
+            print(f"Inserted NEW {status} person to Qdrant (Track {tracklet.id}) | Gender: {new_payload.get('person_gender', 'N/A')} | Upper: {new_payload.get('upper_color', 'N/A')} | Lower: {new_payload.get('lower_color', 'N/A')}")
+            return True
         
     except Exception as e:
         print(f"⚠ Failed to insert tracklet {tracklet.id} to Qdrant: {e}")
@@ -1486,9 +1807,10 @@ class Tracklet:
         
         self.verified = False
         self.inserted = False  # set True once pushed to DB
+        self.genders = deque(maxlen=20)  # Track detected gender ('male'/'female')
         self.tracker = None
 
-    def update(self, bbox, idx, face_emb=None, reid_emb=None, face_size=0, clip_emb=None, carried=None, upper_color=None, lower_color=None, attributes=None):
+    def update(self, bbox, idx, face_emb=None, reid_emb=None, face_size=0, clip_emb=None, carried=None, upper_color=None, lower_color=None, attributes=None, gender=None):
         self.bboxes.append(bbox)
         self.last_frame = idx
         if face_emb is not None: 
@@ -1508,6 +1830,8 @@ class Tracklet:
             self.upper_colors.append(upper_color)
         if lower_color is not None:
             self.lower_colors.append(lower_color)
+        if gender is not None:
+            self.genders.append(gender)
         
         # Update attributes (dict of attribute_name -> bool)
         if attributes:
@@ -1578,6 +1902,15 @@ class Tracklet:
         for color in self.lower_colors:
             color_counts[color] = color_counts.get(color, 0) + 1
         return max(color_counts, key=color_counts.get) if color_counts else None
+    
+    def get_dominant_gender(self):
+        """Get most frequently observed gender."""
+        if not self.genders:
+            return None
+        gender_counts = {}
+        for g in self.genders:
+            gender_counts[g] = gender_counts.get(g, 0) + 1
+        return max(gender_counts, key=gender_counts.get) if gender_counts else None
     
     def get_attribute_summary(self):
         """Get summary of detected attributes (most frequently observed values).
@@ -1818,7 +2151,7 @@ while REALTIME_FACE_COMPARISON:
                 # Skip boxes with extreme aspect ratios
                 # Relaxed aspect ratio checks for close-ups (close-up faces/upper body can be wider)
                 aspect_ratio = box_width / max(box_height, 1)
-                if aspect_ratio > 1.2:  # Too wide (relaxed from 0.8 for close-ups)
+                if aspect_ratio > 2.5:  # Too wide (relaxed from 1.2 for close-ups)
                     filtered_counts["aspect_ratio"] += 1
                     continue
                 
@@ -2355,7 +2688,7 @@ while REALTIME_FACE_COMPARISON:
                     tracklets[current_tid].last_frame = frame_idx
 
                 # ---- Optimized face and ReID extraction
-                face_emb, face_size = extract_face_embedding_optimized(crop_person, face_boxes_frame, vis_bbox)
+                face_emb, face_size, gender = extract_face_embedding_optimized(crop_person, face_boxes_frame, vis_bbox, frame=frame)
                 reid_emb = reid_encode(crop_person)
                 
                 # ---- Carried objects association (EXTREMELY STRICT spatial checks)
@@ -2451,7 +2784,7 @@ while REALTIME_FACE_COMPARISON:
                 # Update tracklet with face and ReID embeddings
                 # Use vis_bbox (person detection box) for accurate visualization
                 t = tracklets[current_tid]
-                t.update(vis_bbox, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes)
+                t.update(vis_bbox, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender)
                 
                 # Debug output (reduced frequency)
                 if frame_idx <= 100:  # Only first 100 frames
@@ -2483,6 +2816,28 @@ while REALTIME_FACE_COMPARISON:
                 if box in matched_person_boxes:
                     continue  # Already processed by ByteTrack
                 
+                # CONTAINMENT CHECK: Suppress partial detections that overlap with existing tracks
+                # When a person moves fast, the tracker box may lag and YOLO detects the
+                # exposed head/body as a "new" person. Check if this detection overlaps
+                # significantly with any existing tracked box.
+                is_duplicate = False
+                for track in tracked_objects:
+                    tb = (int(track.tlbr[0]), int(track.tlbr[1]), int(track.tlbr[2]), int(track.tlbr[3]))
+                    ox1 = max(box[0], tb[0]); oy1 = max(box[1], tb[1])
+                    ox2 = min(box[2], tb[2]); oy2 = min(box[3], tb[3])
+                    if ox2 > ox1 and oy2 > oy1:
+                        overlap_area = (ox2 - ox1) * (oy2 - oy1)
+                        det_area = max(1, (box[2] - box[0]) * (box[3] - box[1]))
+                        track_area = max(1, (tb[2] - tb[0]) * (tb[3] - tb[1]))
+                        containment = overlap_area / det_area
+                        reverse_containment = overlap_area / track_area
+                        if containment > 0.3 or reverse_containment > 0.3:
+                            is_duplicate = True
+                            break
+                
+                if is_duplicate:
+                    continue  # Skip — this is a partial detection of an already-tracked person
+                
                 # Use IOU-based matching for unmatched person boxes
                 x1,y1,x2,y2 = box
                 crop_person = frame[y1:y2, x1:x2].copy()
@@ -2509,7 +2864,7 @@ while REALTIME_FACE_COMPARISON:
                     tracklets[current_tid] = Tracklet(current_tid, box, frame_idx)
                 
                 # Extract face and ReID for this unmatched person box
-                face_emb, face_size = extract_face_embedding_optimized(crop_person, face_boxes_frame, box)
+                face_emb, face_size, gender = extract_face_embedding_optimized(crop_person, face_boxes_frame, box, frame=frame)
                 reid_emb = reid_encode(crop_person)
                 
                 # ---- Carried objects + context-aware CLIP (EXTREMELY STRICT)
@@ -2575,7 +2930,7 @@ while REALTIME_FACE_COMPARISON:
                     detected_attributes = None
 
                 t = tracklets[current_tid]
-                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes)
+                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender)
         
         # Fallback: If ByteTrack is not available or no tracked objects, use IOU-based matching
         if not USE_BYTETRACK or len(tracked_objects) == 0:
@@ -2599,7 +2954,7 @@ while REALTIME_FACE_COMPARISON:
                     tracklets[current_tid] = Tracklet(current_tid, box, frame_idx)
                 
                 # Optimized face and ReID extraction
-                face_emb, face_size = extract_face_embedding_optimized(crop_person, face_boxes_frame, box)
+                face_emb, face_size, gender = extract_face_embedding_optimized(crop_person, face_boxes_frame, box, frame=frame)
                 reid_emb = reid_encode(crop_person)
                 
                 # ---- Carried objects + context-aware CLIP (EXTREMELY STRICT)
@@ -2666,7 +3021,7 @@ while REALTIME_FACE_COMPARISON:
                 
                 # Update tracklet
                 t = tracklets[current_tid]
-                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes)
+                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender)
 
     # --------------------------
     # Verification logic and tracklet insertion
