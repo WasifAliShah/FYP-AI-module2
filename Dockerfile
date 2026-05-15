@@ -15,7 +15,9 @@ COPY requirements.txt .
 COPY video_processing_temporal/requirements.txt ./video_processing_temporal/
 
 # Install python dependencies
-RUN pip install --default-timeout=1000 --no-cache-dir --upgrade pip && \
+# FIX: Pre-install numpy, cython, and build tools so git-based packages can compile their wheels
+RUN pip install --default-timeout=1000 --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --default-timeout=1000 --no-cache-dir numpy cython && \
     pip install --default-timeout=1000 --no-cache-dir -r requirements.txt && \
     pip install --default-timeout=1000 --no-cache-dir -r video_processing_temporal/requirements.txt
 
