@@ -56,8 +56,9 @@ async def main():
     """
     print("[MAIN] Starting main async function", flush=True)
     
+    import os
     # Connect to Temporal server
-    temporal_host = "localhost:7233"  # Change this if your Temporal server is elsewhere
+    temporal_host = os.getenv("TEMPORAL_HOST", "localhost:7233")
     
     logger.info(f"Connecting to Temporal server at {temporal_host}...")
     print(f"[CONNECT] Connecting to Temporal at {temporal_host}", flush=True)

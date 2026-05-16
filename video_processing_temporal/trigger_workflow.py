@@ -17,7 +17,9 @@ async def main():
     Trigger a test workflow for video processing.
     """
     # Connect to Temporal server
-    client = await Client.connect("localhost:7233")
+    import os
+    temporal_host = os.getenv("TEMPORAL_HOST", "localhost:7233")
+    client = await Client.connect(temporal_host)
     
     # Sample video data (replace with actual data)
     video_data = {
