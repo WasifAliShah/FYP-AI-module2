@@ -12,7 +12,8 @@ ultralytics>=8.0.0
 
 # Face Recognition
 insightface>=0.7.3
-onnxruntime>=1.12.0
+# Use the GPU build on T4/CUDA machines; falls back to CPU if the GPU wheel isn't installed.
+onnxruntime-gpu>=1.12.0
 
 # ReID (Person Re-identification)
 # torchreid>=1.4.0

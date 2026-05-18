@@ -637,16 +637,56 @@ async def store_results_activity(processing_result: Dict[str, Any]) -> Dict[str,
             except Exception as e:
                 activity.logger.warning(f"Could not delete video file: {e}")
         
+        # Scroll person tracks to get detailed info (gender, colors, reappearances, etc.)
+        person_details = []
+        try:
+            person_points, _ = client.scroll(
+                collection_name="person_tracks",
+                scroll_filter=Filter(must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))]),
+                limit=1000,
+                with_payload=True,
+                with_vectors=False,
+            )
+            
+            for p in person_points:
+                payload = p.payload if hasattr(p, "payload") else {}
+                person_details.append({
+                    "track_id": payload.get("track_id"),
+                    "similarity_score": payload.get("avg_confidence", 0.0),
+                    "start_time": payload.get("start_time"),
+                    "end_time": payload.get("end_time"),
+                    "num_frames": payload.get("num_frames"),
+                    "person_gender": payload.get("person_gender"),
+                    "upper_color": payload.get("upper_color"),
+                    "lower_color": payload.get("lower_color"),
+                    "attributes": payload.get("attributes", {}),
+                    "object_carried": payload.get("object_carried", []),
+                    "has_reappearance": payload.get("has_reappearance", False),
+                    "total_appearances": payload.get("total_appearances", 1),
+                    "reappearances": payload.get("reappearances", []),
+                    "merged_track_ids": payload.get("merged_track_ids", []),
+                })
+            
+            activity.logger.info(f"Extracted {len(person_details)} person detail records from Qdrant")
+        except Exception as detail_err:
+            activity.logger.warning(f"Could not extract person details: {detail_err}")
+
+        # If it was an ingest (no query run), populate query_results with all detected persons
+        # so the backend has immediate access to all the parsed metadata (gender, reappearances)
+        if not query_results and person_details:
+            query_results = person_details
+        
         activity.logger.info(f"✅ Results verified and stored for video_id: {video_id}")
         activity.logger.info(f"   Query results to send: {len(query_results)} items")
         if query_results:
             activity.logger.info(f"   First result preview: {query_results[0] if query_results else 'N/A'}")
         
-        # Include query_results in the callback details so backend can store in search_results table
+        # Include query_results in the callback details
         callback_details = {
             "persons": person_count.count, 
             "objects": object_count.count,
-            "query_results": query_results  # Pass the actual query results to backend
+            "query_results": query_results,
+            "person_details": person_details
         }
         activity.logger.info(f"📤 Sending callback with details: persons={callback_details['persons']}, objects={callback_details['objects']}, query_results_count={len(callback_details['query_results'])}")
         _post_status_update(video_id, 'completed', 'Results stored', details=callback_details)
@@ -657,7 +697,8 @@ async def store_results_activity(processing_result: Dict[str, Any]) -> Dict[str,
             "total_persons": person_count.count,
             "total_objects": object_count.count,
             "qdrant_verified": True,
-            "query_results": query_results  # Pass through any query results
+            "query_results": query_results,
+            "person_details": person_details
         }
         
     except Exception as e:
