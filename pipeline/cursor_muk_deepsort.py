@@ -119,13 +119,14 @@ class _DeepSortByteTrackCompat:
     Each returned track has attributes: track_id, tlbr (x1,y1,x2,y2)
     """
     def __init__(self, **kwargs):
-        # Use 'mobilenet' embedder (built-in, works on CPU without external dependencies)
+        # Use 'mobilenet' embedder; enable GPU only when CUDA is available.
         self.require_confirmation = kwargs.get('require_confirmation', True)  # For persons: require confirmed tracks
         n_init_val = 3 if self.require_confirmation else 1  # Higher n_init for persons to avoid ID churn
+        use_gpu = kwargs.get('use_gpu', USE_GPU_ACCELERATION)
         
         self.ds = DeepSort(
             embedder='mobilenet',
-            embedder_gpu=False,
+            embedder_gpu=use_gpu,
             max_age=kwargs.get('track_buffer', 30),
             n_init=n_init_val,
             max_iou_distance=0.85,  # Increased from 0.7 — tolerate more displacement for fast-moving persons
@@ -251,6 +252,7 @@ IOU_THRESHOLD = 0.40
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Using device:", DEVICE)
 print("Real-ESRGAN available:", USE_REAL_ESRGAN)
+USE_GPU_ACCELERATION = DEVICE == "cuda"
 
 # CLIP for text-image embeddings (load after DEVICE is defined)
 USE_CLIP = False
@@ -289,8 +291,8 @@ fa = None
 if INSIGHTFACE_AVAILABLE:
     fa = FaceAnalysis(allowed_modules=['detection', 'landmark', 'recognition', 'genderage'])
     print("Preparing InsightFace...")
-    # -1 = CPU. If you have GPU and insightface compiled with GPU support, set ctx_id=0
-    fa.prepare(ctx_id=-1, det_size=(1024, 1024))
+    # Use GPU on CUDA systems, otherwise stay on CPU.
+    fa.prepare(ctx_id=0 if USE_GPU_ACCELERATION else -1, det_size=(1024, 1024))
     print("InsightFace ready.")
 
 # ReID encoder: Try TorchReID first, fallback to ResNet50
@@ -343,8 +345,15 @@ if USE_DEEPSORT:
         fps = cap_temp.get(cv2.CAP_PROP_FPS) or 30.0
         cap_temp.release()
         # For persons: require confirmed tracks (n_init=3) to avoid ID churn
-        byte_tracker = _DeepSortByteTrackCompat(track_buffer=60, require_confirmation=True)
-        print(f"✓ DeepSORT initialized for persons (FPS: {fps:.1f}, n_init=3 for stability)")
+        byte_tracker = _DeepSortByteTrackCompat(
+            track_buffer=60,
+            require_confirmation=True,
+            use_gpu=USE_GPU_ACCELERATION,
+        )
+        print(
+            f"✓ DeepSORT initialized for persons (FPS: {fps:.1f}, n_init=3 for stability, "
+            f"GPU: {'enabled' if USE_GPU_ACCELERATION else 'disabled'})"
+        )
         # For small objects like phones, use IoU-based tracking instead (simpler and faster)
         # DeepSORT's appearance embedder is not needed for small objects
         byte_tracker_objects = None  # Use fallback IoU-based tracking for objects
@@ -478,29 +487,30 @@ def get_dominant_color(crop, debug=False):
         # ============================================================
         total_brown_ratio = 0.0
 
-        # PRIORITY 1: BLACK detection (very dark)
+        # Calculate masks for basic colors to prevent background bias
         black_mask = (V < 60)
         black_ratio = float(np.sum(black_mask) / total_pixels)
-        if (v_mean < 65 and s_mean < 85 and total_brown_ratio < 0.15) or black_ratio > 0.25:
-            return "black"
-
-        # PRIORITY 2: WHITE detection (catches remaining whites)
+        
         white_mask = (V > 190) & (S < 50)
         white_ratio = float(np.sum(white_mask) / total_pixels)
         
-        if v_mean > 200 and s_mean < 50:
-            return "white"
-        if white_ratio > 0.30 and s_mean < 50:
-            return "white"
-        
-        # PRIORITY 3: GRAY detection
         gray_mask = (S < 45) & (V >= 50) & (V <= 195)
         gray_ratio = float(np.sum(gray_mask) / total_pixels)
-        
+
+        # PRIORITY 1: WHITE (if a significant portion is bright white, it's likely a white shirt despite dark backgrounds)
+        if white_ratio > 0.25 and s_mean < 50:
+            return "white"
+            
+        # PRIORITY 2: GRAY
         if gray_ratio > 0.40 and total_brown_ratio < 0.15:
             return "gray"
         if s_mean < 35 and 70 < v_mean < 195 and total_brown_ratio < 0.15:
             return "gray"
+
+        # PRIORITY 3: BLACK
+        # Only return black if it significantly outnumbers white/gray, or is overwhelming
+        if (v_mean < 65 and s_mean < 85 and total_brown_ratio < 0.15) or (black_ratio > 0.40 and black_ratio > white_ratio * 2 and black_ratio > gray_ratio * 2):
+            return "black"
 
         # Filter to colorful pixels for hue analysis
         valid = (V > 35) & (V < 245) & (S > 30)
@@ -546,33 +556,47 @@ def get_dominant_color(crop, debug=False):
         return None
 
 def mask_upper_by_face(crop_person, face_boxes_in_frame, person_box):
-    """Mask out face area from the upper half of the person crop to avoid skin tones.
-    Returns a modified upper_part image with the face region blacked out.
-    face_boxes_in_frame: list of (x1,y1,x2,y2) in full-frame coords
-    person_box: (x1,y1,x2,y2) of person in full-frame coords
+    """Extract the upper clothing region by targeting the area directly BELOW the face.
+    This prevents hats/hair (above the face) from being detected as the upper clothing color.
     """
     if crop_person is None or crop_person.size == 0:
         return None
     h, w = crop_person.shape[:2]
-    upper = crop_person[:h//2, :].copy()
-    if not face_boxes_in_frame:
-        return upper
     px1, py1, px2, py2 = person_box
-    # Iterate faces that intersect person_box and map to crop coordinates
-    for (fx1, fy1, fx2, fy2) in face_boxes_in_frame:
-        # Check intersection with person box
-        ix1 = max(px1, fx1); iy1 = max(py1, fy1)
-        ix2 = min(px2, fx2); iy2 = min(py2, fy2)
-        if ix2 <= ix1 or iy2 <= iy1:
-            continue
-        # Map to crop local coordinates
-        lx1 = max(0, ix1 - px1)
-        ly1 = max(0, iy1 - py1)
-        lx2 = min(w, ix2 - px1)
-        ly2 = min(h//2, iy2 - py1)  # only mask within upper half
-        if lx2 > lx1 and ly2 > ly1:
-            upper[ly1:ly2, lx1:lx2] = 0  # black out face region
-    return upper
+    
+    face_bottom_local = -1
+    
+    if face_boxes_in_frame:
+        for (fx1, fy1, fx2, fy2) in face_boxes_in_frame:
+            ix1 = max(px1, fx1); iy1 = max(py1, fy1)
+            ix2 = min(px2, fx2); iy2 = min(py2, fy2)
+            if ix2 > ix1 and iy2 > iy1:
+                face_bottom_local = max(face_bottom_local, iy2 - py1)
+                
+    if face_bottom_local > 0:
+        # We found the face! The upper clothing is always directly below the chin.
+        # Take the region from the bottom of the face extending downwards by 35% of the total height.
+        start_y = face_bottom_local
+        end_y = min(h, start_y + int(h * 0.35))
+        
+        # Fallback if face goes all the way to the bottom edge
+        if start_y >= h - 10:
+            start_y = int(h * 0.75)
+            end_y = h
+            
+        upper = crop_person[start_y:end_y, :]
+        if upper.size > 0:
+            return upper.copy()
+            
+    # Fallback if no face was detected
+    aspect_ratio = h / max(1, w)
+    if aspect_ratio < 1.6:
+        # Close-up shot: chest/shoulders are at the very bottom
+        return crop_person[int(h * 0.7):, :].copy()
+    else:
+        # Full-body shot: chest is roughly between 20% and 50% down.
+        # We start at 20% to explicitly skip the head/hat!
+        return crop_person[int(h * 0.2):int(h * 0.5), :].copy()
 
 def detect_person_attributes(crop, face_crop=None):
     """Detect person attributes from crop image with strict validation.
@@ -600,53 +624,137 @@ def detect_person_attributes(crop, face_crop=None):
     try:
         crop_h, crop_w = crop.shape[:2]
         
-        # === HAT DETECTION (STRICT) ===
-        # Only detect if there's a DISTINCT shape at top (not just texture)
-        top_region = crop[:max(1, crop_h // 6), :]  # Top 16% only
-        if top_region.size > 0 and top_region.shape[0] > 5:
-            gray = cv2.cvtColor(top_region, cv2.COLOR_BGR2GRAY)
-            # Use higher threshold for Laplacian - only strong edge/shape definition counts
-            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-            variance = np.var(laplacian)
-            # VERY HIGH THRESHOLD - only distinct hat shapes
-            # Normal texture variance: 50-150
-            # Hat shape variance: 300+
-            if variance > 400:
-                # Additional check: ensure it's a localized blob, not just noisy texture
-                edges = cv2.Canny(gray, 50, 150)
-                edge_pixels = np.sum(edges > 0)
-                # Hat should have concentrated edges at top
-                if edge_pixels > top_region.size * 0.05:  # At least 5% edges
-                    attributes["has_hat"] = True
-        
-        # === HOOD DETECTION (STRICTER) ===
-        # Only mark hood if there is a strong peaked silhouette AND hat is not already detected
+        # === HOOD DETECTION (RUN FIRST) ===
+        # Detect hood BEFORE hat, because hoods create the same edge patterns as hats.
+        # If a hood is detected, we skip hat detection entirely.
         top_quarter = crop[:crop_h // 5, :]
-        if top_quarter.size > 0 and top_quarter.shape[0] > 5 and not attributes["has_hat"]:
+        if top_quarter.size > 0 and top_quarter.shape[0] > 5:
             gray_top = cv2.cvtColor(top_quarter, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gray_top, 60, 180)  # Slightly stricter edges
+            edges = cv2.Canny(gray_top, 60, 180)
 
             # Peak check at top 2 rows (hood tip) and shoulders (rows 3-6)
-            top_rows = edges[0:2, :]
-            shoulder_rows = edges[2:6, :]
-            mid_col = top_rows.shape[1] // 2
-            left_top = np.sum(top_rows[:, :mid_col])
-            right_top = np.sum(top_rows[:, mid_col:])
-            left_shoulder = np.sum(shoulder_rows[:, :mid_col])
-            right_shoulder = np.sum(shoulder_rows[:, mid_col:])
+            if edges.shape[0] >= 6:
+                top_rows = edges[0:2, :]
+                shoulder_rows = edges[2:6, :]
+                mid_col = top_rows.shape[1] // 2
+                left_top = np.sum(top_rows[:, :mid_col])
+                right_top = np.sum(top_rows[:, mid_col:])
+                left_shoulder = np.sum(shoulder_rows[:, :mid_col])
+                right_shoulder = np.sum(shoulder_rows[:, mid_col:])
 
-            edge_density = np.sum(edges > 0) / edges.size
+                edge_density = np.sum(edges > 0) / edges.size
 
-            # Hood criteria (much stricter):
-            # 1) High edge density > 0.22
-            # 2) Symmetric peak at top (both sides > 12 edge pixels)
-            # 3) Shoulders also have edges (> 20 per side) to indicate fabric fold
-            if (
-                edge_density > 0.22
-                and min(left_top, right_top) > 12
-                and min(left_shoulder, right_shoulder) > 20
-            ):
-                attributes["has_hood"] = True
+                if (
+                    edge_density > 0.22
+                    and min(left_top, right_top) > 12
+                    and min(left_shoulder, right_shoulder) > 20
+                ):
+                    attributes["has_hood"] = True
+            
+            # Also check color similarity between head and torso (hood = same garment)
+            if not attributes["has_hood"]:
+                upper_body = crop[crop_h // 3 : crop_h // 2, :]
+                if upper_body.size > 0 and upper_body.shape[0] > 3:
+                    top_region_hood = crop[:max(1, crop_h // 6), :]
+                    if top_region_hood.size > 0 and top_region_hood.shape[0] > 3:
+                        top_hsv = cv2.cvtColor(top_region_hood, cv2.COLOR_BGR2HSV)
+                        body_hsv = cv2.cvtColor(upper_body, cv2.COLOR_BGR2HSV)
+                        
+                        top_hue = np.mean(top_hsv[:, :, 0])
+                        top_sat = np.mean(top_hsv[:, :, 1])
+                        top_val = np.mean(top_hsv[:, :, 2])
+                        body_hue = np.mean(body_hsv[:, :, 0])
+                        body_sat = np.mean(body_hsv[:, :, 1])
+                        body_val = np.mean(body_hsv[:, :, 2])
+                        
+                        hue_diff = min(abs(top_hue - body_hue), 180 - abs(top_hue - body_hue))
+                        sat_diff = abs(top_sat - body_sat)
+                        val_diff = abs(top_val - body_val)
+                        
+                        # Head covering matches torso color = hood
+                        if hue_diff < 15 and sat_diff < 40 and val_diff < 50:
+                            attributes["has_hood"] = True
+                        
+                        # For desaturated colors (grey/brown/black), compare brightness only
+                        if top_sat < 40 and body_sat < 40 and val_diff < 50:
+                            attributes["has_hood"] = True
+        
+        # === HAT DETECTION (ONLY if no hood detected) ===
+        # Skip entirely if hood was already found — hoods and hats create identical edge patterns
+        if not attributes["has_hood"]:
+            top_region = crop[:max(1, crop_h // 6), :]
+            if top_region.size > 0 and top_region.shape[0] > 5:
+                gray = cv2.cvtColor(top_region, cv2.COLOR_BGR2GRAY)
+                laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+                variance = np.var(laplacian)
+                if variance > 400:
+                    edges = cv2.Canny(gray, 50, 150)
+                    edge_pixels = np.sum(edges > 0)
+                    if edge_pixels > top_region.size * 0.05:
+                        # SCARF/HIJAB VS HAT DISAMBIGUATION:
+                        # A scarf or hijab wraps around the head and extends down the sides of the face/neck.
+                        # A hat sits only on top.
+                        # Check if the color at the top matches the color at the sides of the neck (16%-33% down).
+                        is_likely_scarf = False
+                        
+                        neck_region = crop[crop_h // 6 : crop_h // 3, :]
+                        if neck_region.size > 0 and neck_region.shape[0] > 3:
+                            # Focus on the sides of the neck region (left 25% and right 25%)
+                            # where a scarf would drape down.
+                            left_neck = neck_region[:, :max(1, crop_w // 4)]
+                            right_neck = neck_region[:, -max(1, crop_w // 4):]
+                            
+                            # Combine left and right for color analysis
+                            if left_neck.size > 0 and right_neck.size > 0:
+                                sides_neck = np.hstack((left_neck, right_neck))
+                                
+                                top_hsv = cv2.cvtColor(top_region, cv2.COLOR_BGR2HSV)
+                                neck_hsv = cv2.cvtColor(sides_neck, cv2.COLOR_BGR2HSV)
+                                
+                                top_hue = np.mean(top_hsv[:, :, 0])
+                                top_sat = np.mean(top_hsv[:, :, 1])
+                                top_val = np.mean(top_hsv[:, :, 2])
+                                
+                                neck_hue = np.mean(neck_hsv[:, :, 0])
+                                neck_sat = np.mean(neck_hsv[:, :, 1])
+                                neck_val = np.mean(neck_hsv[:, :, 2])
+                                
+                                hue_diff = min(abs(top_hue - neck_hue), 180 - abs(top_hue - neck_hue))
+                                sat_diff = abs(top_sat - neck_sat)
+                                val_diff = abs(top_val - neck_val)
+                                
+                                # If the top of head matches the sides of the neck closely,
+                                # it is a wrap/scarf extending downwards, NOT a hat.
+                                if hue_diff < 15 and sat_diff < 40 and val_diff < 50:
+                                    is_likely_scarf = True
+                                
+                                # Fallback for desaturated colors (black/white/grey)
+                                if top_sat < 40 and neck_sat < 40 and val_diff < 50:
+                                    is_likely_scarf = True
+                        
+                        if not is_likely_scarf:
+                            attributes["has_hat"] = True
+                            
+            # Fallback for close-up shots where the top 16% is just solid hat fabric (no edges)
+            if not attributes["has_hat"] and crop_h / max(1, crop_w) < 1.5:
+                top_region = crop[:max(1, crop_h // 6), :]
+                if top_region.size > 0:
+                    gray_top = cv2.cvtColor(top_region, cv2.COLOR_BGR2GRAY)
+                    lap_var = np.var(cv2.Laplacian(gray_top, cv2.CV_64F))
+                    
+                    # 1. A completely flat/featureless block of color at the top (like a beanie)
+                    if lap_var < 80:
+                        attributes["has_hat"] = True
+                        
+                    # 2. Look for a strong horizontal edge in the top 45% (like a hat brim)
+                    if not attributes["has_hat"]:
+                        top_half = crop[:int(crop_h * 0.45), :]
+                        if top_half.size > 0 and top_half.shape[0] > 10:
+                            gray_half = cv2.cvtColor(top_half, cv2.COLOR_BGR2GRAY)
+                            sobel_y = cv2.Sobel(gray_half, cv2.CV_64F, 0, 1, ksize=3)
+                            row_edge_strength = np.mean(np.absolute(sobel_y), axis=1)
+                            if len(row_edge_strength) > 0 and np.max(row_edge_strength) > 40:
+                                attributes["has_hat"] = True
         
         # === GLASSES DETECTION (STRICT) ===
         if face_crop is not None and face_crop.size > 0:
@@ -1325,7 +1433,7 @@ def insert_tracklet_to_qdrant(client, tracklet, video_id=1, segment_id=None, fra
             "start_time": start_time_str,
             "end_time": end_time_str,
             "num_frames": num_frames,
-            "avg_confidence": 0.85,
+            "avg_confidence": tracklet.get_avg_confidence(),
             "timestamp": datetime.now().isoformat(),
         }
         
@@ -1808,11 +1916,13 @@ class Tracklet:
         self.verified = False
         self.inserted = False  # set True once pushed to DB
         self.genders = deque(maxlen=20)  # Track detected gender ('male'/'female')
+        self.confidences = deque(maxlen=AGGREGATION_FRAMES) # NEW: Track confidences
         self.tracker = None
 
-    def update(self, bbox, idx, face_emb=None, reid_emb=None, face_size=0, clip_emb=None, carried=None, upper_color=None, lower_color=None, attributes=None, gender=None):
+    def update(self, bbox, idx, face_emb=None, reid_emb=None, face_size=0, clip_emb=None, carried=None, upper_color=None, lower_color=None, attributes=None, gender=None, conf=0.85):
         self.bboxes.append(bbox)
         self.last_frame = idx
+        self.confidences.append(conf) # NEW: Store confidence
         if face_emb is not None: 
             self.face_embs.append(face_emb)
             if face_size > 0:
@@ -1838,6 +1948,10 @@ class Tracklet:
             for attr_name, attr_value in attributes.items():
                 if attr_name in self.attributes and isinstance(attr_value, bool):
                     self.attributes[attr_name].append(attr_value)
+
+    def get_avg_confidence(self):
+        if not self.confidences: return 0.85
+        return float(np.mean(self.confidences))
 
     def avg_face(self):
         if not self.face_embs: return None
@@ -2181,7 +2295,7 @@ while REALTIME_FACE_COMPARISON:
                 person_boxes = []
                 person_detections = []
                 for idx in nms_indices:
-                    person_boxes.append(all_detections[idx])
+                    person_boxes.append((all_detections[idx], all_scores[idx]))
                     x1, y1, x2, y2 = all_detections[idx]
                     person_detections.append([x1, y1, x2, y2, all_scores[idx]])
             else:
@@ -2644,22 +2758,26 @@ while REALTIME_FACE_COMPARISON:
                 
                 # Find the closest person box to this ByteTrack bbox (for face/ReID extraction)
                 best_box = None
+                best_conf = 0.85 # default fallback
                 best_iou_val = 0
-                for box in person_boxes:
+                for box, conf in person_boxes:
                     iou_val = iou(byte_track_bbox, box)
                     if iou_val > best_iou_val:
                         best_iou_val = iou_val
                         best_box = box
+                        best_conf = conf
                 
                 # Use best matching person box for face/ReID, or ByteTrack bbox if no good match
                 # Prefer person detection box (more accurate) over ByteTrack predicted box
                 # Lower threshold to 0.2 to catch more matches (ByteTrack bboxes might be slightly off)
                 if best_box and best_iou_val > 0.2:  # More lenient overlap threshold
                     box = best_box
+                    person_conf = best_conf
                     # Use person detection box for visualization (more accurate)
                     vis_bbox = best_box
                 else:
                     box = byte_track_bbox
+                    person_conf = float(track.score) if hasattr(track, 'score') else 0.85
                     # Use ByteTrack bbox if no person box matches - still visualize it!
                     vis_bbox = byte_track_bbox
                 
@@ -2774,9 +2892,18 @@ while REALTIME_FACE_COMPARISON:
                 # Detect clothing colors (every frame for accuracy)
                 person_h, person_w = crop_person.shape[:2]
                 upper_part = mask_upper_by_face(crop_person, face_boxes_frame, vis_bbox)
-                lower_part = crop_person[person_h//2:, :]
                 upper_color = get_dominant_color(upper_part)
-                lower_color = get_dominant_color(lower_part)
+                
+                # Check if lower body is actually visible
+                aspect_ratio = person_h / max(1, person_w)
+                is_cut_off_bottom = vis_bbox[3] >= frame.shape[0] - 10
+                
+                # If aspect ratio is small (square-ish) OR cut off at bottom without being tall enough
+                if aspect_ratio < 1.3 or (is_cut_off_bottom and aspect_ratio < 1.8):
+                    lower_color = None
+                else:
+                    lower_part = crop_person[person_h//2:, :]
+                    lower_color = get_dominant_color(lower_part)
                 
                 # Detect person attributes (every frame for accuracy)
                 detected_attributes = detect_person_attributes(crop_person, None)
@@ -2784,7 +2911,7 @@ while REALTIME_FACE_COMPARISON:
                 # Update tracklet with face and ReID embeddings
                 # Use vis_bbox (person detection box) for accurate visualization
                 t = tracklets[current_tid]
-                t.update(vis_bbox, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender)
+                t.update(vis_bbox, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender, conf=person_conf)
                 
                 # Debug output (reduced frequency)
                 if frame_idx <= 100:  # Only first 100 frames
@@ -2916,9 +3043,16 @@ while REALTIME_FACE_COMPARISON:
                 if frame_idx % 10 == 0:
                     person_h, person_w = crop_person.shape[:2]
                     upper_part = mask_upper_by_face(crop_person, face_boxes_frame, box)
-                    lower_part = crop_person[person_h//2:, :]
                     upper_color = get_dominant_color(upper_part)
-                    lower_color = get_dominant_color(lower_part)
+                    
+                    aspect_ratio = person_h / max(1, person_w)
+                    is_cut_off_bottom = box[3] >= frame.shape[0] - 10
+                    
+                    if aspect_ratio < 1.3 or (is_cut_off_bottom and aspect_ratio < 1.8):
+                        lower_color = None
+                    else:
+                        lower_part = crop_person[person_h//2:, :]
+                        lower_color = get_dominant_color(lower_part)
                 else:
                     upper_color = None
                     lower_color = None
@@ -2930,12 +3064,12 @@ while REALTIME_FACE_COMPARISON:
                     detected_attributes = None
 
                 t = tracklets[current_tid]
-                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender)
+                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender, conf=conf)
         
         # Fallback: If ByteTrack is not available or no tracked objects, use IOU-based matching
         if not USE_BYTETRACK or len(tracked_objects) == 0:
             # Process each person box with IOU-based matching
-            for box in person_boxes:
+            for box, conf in person_boxes:
                 x1,y1,x2,y2 = box
                 crop_person = frame[y1:y2, x1:x2].copy()
                 
@@ -3006,9 +3140,16 @@ while REALTIME_FACE_COMPARISON:
                 if frame_idx % 10 == 0:
                     person_h, person_w = crop_person.shape[:2]
                     upper_part = mask_upper_by_face(crop_person, face_boxes_frame, box)
-                    lower_part = crop_person[person_h//2:, :]
                     upper_color = get_dominant_color(upper_part)
-                    lower_color = get_dominant_color(lower_part)
+                    
+                    aspect_ratio = person_h / max(1, person_w)
+                    is_cut_off_bottom = box[3] >= frame.shape[0] - 10
+                    
+                    if aspect_ratio < 1.3 or (is_cut_off_bottom and aspect_ratio < 1.8):
+                        lower_color = None
+                    else:
+                        lower_part = crop_person[person_h//2:, :]
+                        lower_color = get_dominant_color(lower_part)
                 else:
                     upper_color = None
                     lower_color = None
@@ -3021,7 +3162,7 @@ while REALTIME_FACE_COMPARISON:
                 
                 # Update tracklet
                 t = tracklets[current_tid]
-                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender)
+                t.update(box, frame_idx, face_emb, reid_emb, face_size, clip_emb, carried_objs, upper_color, lower_color, detected_attributes, gender=gender, conf=conf)
 
     # --------------------------
     # Verification logic and tracklet insertion
@@ -4332,10 +4473,14 @@ try:
                 "start_time": payload.get('start_time'),
                 "end_time": payload.get('end_time'),
                 "num_frames": payload.get('num_frames'),
+                "person_gender": payload.get('person_gender'),
                 "upper_color": payload.get('upper_color'),
                 "lower_color": payload.get('lower_color'),
                 "attributes": payload.get('attributes', {}),
-                "object_carried": payload.get('object_carried', [])
+                "object_carried": payload.get('object_carried', []),
+                "has_reappearance": payload.get('has_reappearance', False),
+                "reappearances": payload.get('reappearances', []),
+                "merged_track_ids": payload.get('merged_track_ids', [])
             })
 except Exception as e:
     print(f"Warning: Could not serialize query results: {e}")

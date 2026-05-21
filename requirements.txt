@@ -1,107 +1,58 @@
-absl-py==2.3.1
-albucore==0.0.24
-albumentations==2.0.8
-annotated-types==0.7.0
-anyio==4.12.1
-beautifulsoup4==4.14.3
-blinker==1.9.0
-boto3==1.42.22
-botocore==1.42.22
-certifi==2026.1.4
-charset-normalizer==3.4.4
-cjm-byte-track==0.0.6
-click==8.3.1
-clip==1.0
-colorama==0.4.6
-coloredlogs==15.0.1
-contourpy==1.3.2
-cycler==0.12.1
-Cython==3.2.4
-deep-sort-realtime==1.3.2
-dill==0.4.0
-easydict==1.13
-exceptiongroup==1.3.1
-filelock==3.20.2
-Flask==3.1.2
-flask-cors==6.0.2
-flatbuffers==25.12.19
-fonttools==4.61.1
-fsspec==2025.12.0
-ftfy==6.3.1
-gdown==5.2.0
-grpcio==1.76.0
-h11==0.16.0
-h2==4.3.0
-hpack==4.1.0
-httpcore==1.0.9
-httpx==0.28.1
-humanfriendly==10.0
-hyperframe==6.1.0
-idna==3.11
-ImageIO==2.37.2
-insightface==0.7.3
-itsdangerous==2.2.0
-Jinja2==3.1.6
-jmespath==1.0.1
-joblib==1.5.3
-kiwisolver==1.4.9
-lazy_loader==0.4
-Markdown==3.10
-MarkupSafe==3.0.3
-matplotlib==3.10.8
-ml_dtypes==0.5.4
-mpmath==1.3.0
-networkx==3.4.2
-nexus-rpc==1.3.0
-numpy==2.2.6
-onnx==1.20.0
-onnxruntime==1.23.2
-opencv-contrib-python==4.12.0.88
-opencv-python==4.12.0.88
-opencv-python-headless==4.12.0.88
-packaging==25.0
-pillow==12.1.0
-polars==1.36.1
-polars-runtime-32==1.36.1
-portalocker==3.2.0
-prettytable==3.17.0
-protobuf==6.33.2
-psutil==7.2.1
-pydantic==2.12.5
-pydantic_core==2.41.5
-pyparsing==3.3.1
-pyreadline3==3.5.4
-PySocks==1.7.1
-python-dateutil==2.9.0.post0
-python-dotenv==1.2.1
-pywin32==311
-PyYAML==6.0.3
-qdrant-client==1.16.2
-regex==2025.11.3
-requests==2.32.5
-s3transfer==0.16.0
-scikit-image==0.25.2
-scikit-learn==1.7.2
-scipy==1.15.3
-simsimd==6.5.12
-six==1.17.0
-soupsieve==2.8.1
-stringzilla==4.6.0
-sympy==1.14.0
-temporalio==1.21.1
-tensorboard==2.20.0
-tensorboard-data-server==0.7.2
-threadpoolctl==3.6.0
-tifffile==2025.5.10
-torch==2.9.1
-torchreid==0.2.5
-torchvision==0.24.1
-tqdm==4.67.1
-types-protobuf==6.32.1.20251210
-typing-inspection==0.4.2
-typing_extensions==4.15.0
-ultralytics==8.3.248
-ultralytics-thop==2.0.18
-urllib3==2.6.2
-wcwidth==0.2.14
-Werkzeug==3.1.4
+# Core dependencies
+numpy>=1.21.0
+opencv-python>=4.5.0
+opencv-contrib-python>=4.5.0
+
+# PyTorch and related
+torch>=1.12.0
+torchvision>=0.13.0
+
+# YOLO (Ultralytics)
+ultralytics>=8.0.0
+
+# Face Recognition
+insightface>=0.7.3
+# Use the GPU build on T4/CUDA machines; falls back to CPU if the GPU wheel isn't installed.
+onnxruntime-gpu>=1.12.0
+
+# ReID (Person Re-identification)
+# torchreid>=1.4.0
+gdown>=4.0.0  # Required dependency for torchreid
+
+tensorboard>=2.20.0
+
+# Multi-object Tracking
+cjm-byte-track>=0.0.6  # ByteTrack for robust multi-object tracking
+
+# Qdrant
+qdrant-client>=1.7.0
+
+# Video Downloaded
+boto3>=1.42.1
+python-dotenv>=1.2.1
+
+# Flask for Image Query Service
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# OpenAI CLIP for text-image embeddings
+git+https://github.com/openai/CLIP.git
+
+# Optional: Real-ESRGAN for super-resolution
+# Uncomment if you want to use Real-ESRGAN
+# realesrgan>=0.3.0
+# basicsr>=1.4.2
+# facexlib>=0.3.0
+# gfpgan>=1.3.8
+
+# Additional utilities (if needed)
+# Pillow>=9.0.0  # Usually comes with torchvision
+deep_sort_realtime>=1.3.2
+git+https://github.com/KaiyangZhou/deep-person-reid.git
+# scipy>=1.7.0  # Sometimes needed for some ML operations
+
+# Note: 
+# - Model files (*.pt, *.onnx) should be downloaded separately or provided
+# - InsightFace models will be downloaded automatically on first run
+# - For GPU support, install PyTorch with CUDA: https://pytorch.org/get-started/locally/
+
