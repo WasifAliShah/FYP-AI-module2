@@ -69,11 +69,11 @@ def _post_status_update(video_id: int, stage: str, message: str = None, status: 
             "workflow_run_id": getattr(activity.info, 'workflow_run_id', None),
             "details": details or {}
         }
-        print(f"[CALLBACK] Sending to {BACKEND_INTERNAL_URL} - stage: {stage}, video_id: {video_id}")
+        activity.logger.info(f"[CALLBACK] Sending to {BACKEND_INTERNAL_URL} - stage: {stage}, video_id: {video_id}")
         response = requests.post(BACKEND_INTERNAL_URL, json=payload, headers=headers, timeout=10)
-        print(f"[CALLBACK] Response: {response.status_code}")
+        activity.logger.info(f"[CALLBACK] Response: {response.status_code}")
+        response.raise_for_status()
     except Exception as e:
-        print(f"[CALLBACK ERROR] Failed: {e}")
         activity.logger.warning(f"Callback post failed: {e}")
 
 # Configure logging
